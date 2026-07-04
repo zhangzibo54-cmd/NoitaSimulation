@@ -4,8 +4,12 @@ import sys
 
 from methods import print_error
 
+# Keep SCons metadata away from the stale .sconsign files created during the
+# first setup attempt. Those files can be locked on Windows, while bin/ remains
+# writable and is already build-output-only.
+SConsignFile(os.path.join("bin", ".sconsign_noita.dblite"))
 
-libname = "EXTENSION-NAME"
+libname = "noita_ext"
 projectdir = "project"
 
 localEnv = Environment(tools=["default"], PLATFORM="")

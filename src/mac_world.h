@@ -1,0 +1,89 @@
+﻿#pragma once
+
+#include "mac_simulation.h"
+
+#include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/image_texture.hpp>
+#include <godot_cpp/classes/node2d.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
+
+#include <cstdint>
+#include <vector>
+
+using namespace godot;
+
+class MacWorld : public Node2D {
+	GDCLASS(MacWorld, Node2D)
+
+public:
+	enum Material : uint8_t {
+		MATERIAL_AIR = MacSimulation::MATERIAL_AIR,
+		MATERIAL_ROCK = MacSimulation::MATERIAL_ROCK,
+		MATERIAL_WATER = MacSimulation::MATERIAL_WATER,
+	};
+
+private:
+	MacSimulation sim;
+
+	float display_scale = 3.0f;
+	bool paused = false;
+	float simulation_speed = 1.0f;
+	float step_accumulator = 0.0f;
+
+	std::vector<uint8_t> rgba_pixels;
+	PackedByteArray pixels;
+	Ref<Image> image;
+	Ref<ImageTexture> texture;
+
+	void update_texture();
+
+protected:
+	static void _bind_methods();
+
+public:
+	MacWorld();
+	~MacWorld() override = default;
+
+	void _ready() override;
+	void _process(double p_delta) override;
+	void _draw() override;
+
+	void set_world_size(int32_t p_width, int32_t p_height);
+	int32_t get_width() const;
+	int32_t get_height() const;
+	void set_display_scale(double p_scale);
+	double get_display_scale() const;
+
+	void set_paused(bool p_paused);
+	bool is_paused() const;
+	void set_simulation_speed(double p_speed);
+	double get_simulation_speed() const;
+	void set_dt(double p_dt);
+	double get_dt() const;
+	void set_gravity(double p_gravity);
+	double get_gravity() const;
+	void set_viscosity(double p_viscosity);
+	double get_viscosity() const;
+	void set_pressure_iterations(int32_t p_iterations);
+	int32_t get_pressure_iterations() const;
+	void set_pressure_active_mass(double p_mass);
+	double get_pressure_active_mass() const;
+	void set_density_correction_strength(double p_strength);
+	double get_density_correction_strength() const;
+	void set_underfill_correction_strength(double p_strength);
+	double get_underfill_correction_strength() const;
+
+	void step();
+	void clear();
+	void generate_basin();
+	void paint_circle(double p_x, double p_y, double p_radius, int32_t p_material);
+	void inject_water(double p_x, double p_y, double p_radius, double p_mass_per_cell, double p_velocity_x, double p_velocity_y);
+
+	double get_total_water_mass() const;
+	int64_t get_water_cell_count() const;
+	double get_average_water_mass() const;
+	double get_last_step_ms() const;
+	int64_t get_step_count() const;
+	int32_t get_last_pcg_iterations() const;
+	double get_last_pcg_residual() const;
+};

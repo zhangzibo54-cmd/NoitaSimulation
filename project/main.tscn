@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://dwrxxln2ydqwc"]
+
+[ext_resource type="Script" uid="uid://k6x05i7i58da" path="res://mac_main.gd" id="1_main"]
+
+[node name="Main" type="Node2D" unique_id=1216597810]
+script = ExtResource("1_main")
