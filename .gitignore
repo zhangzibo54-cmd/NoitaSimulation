@@ -50,3 +50,12 @@ compile_commands.json
 # Cmake
 cmake-build*
 CMakeUserPresets.json
+
+__pycache__/
+*.pyc
+*.tmp
+*.TMP
+.sconsign.dblite
+.sconsign.tmp
+project/bin/
+*~*.TMP
