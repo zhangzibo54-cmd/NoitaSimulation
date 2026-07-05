@@ -8,6 +8,8 @@
 using namespace noita;
 
 namespace {
+constexpr int32_t SLEEP_BLOCKING_OVERLAP_CELLS = 12;
+
 float clampf(float v, float lo, float hi) {
 	return std::max(lo, std::min(v, hi));
 }
@@ -42,6 +44,8 @@ uint32_t hash_u32(uint32_t x) {
 
 void RigidBodySolver::clear() {
 	bodies.clear();
+	body_index_by_id.clear();
+	body_index_dirty = false;
 	static_chunks.clear();
 	static_chunks_x = 0;
 	static_chunks_y = 0;
@@ -60,6 +64,24 @@ void RigidBodySolver::clear() {
 	dragged_body = -1;
 	auto_process_dirty = true;
 	broad_phase_counter = 0;
+}
+
+void RigidBodySolver::mark_body_index_dirty() {
+	body_index_dirty = true;
+}
+
+void RigidBodySolver::rebuild_body_index_map() const {
+	if (!body_index_dirty) {
+		return;
+	}
+	body_index_by_id.clear();
+	body_index_by_id.reserve(bodies.size() * 2 + 1);
+	for (int32_t i = 0; i < static_cast<int32_t>(bodies.size()); i++) {
+		if (bodies[i].active) {
+			body_index_by_id[bodies[i].id] = i;
+		}
+	}
+	body_index_dirty = false;
 }
 
 void RigidBodySolver::set_auto_process_dirty(bool p_enabled) {
@@ -204,6 +226,7 @@ void RigidBodySolver::create_body_from_island(WorldGrid &p_grid) {
 	rebuild_boundary_samples(body);
 	update_body_aabb(body);
 	bodies.push_back(std::move(body));
+	mark_body_index_dirty();
 }
 
 void RigidBodySolver::process_dirty(WorldGrid &p_grid) {
@@ -511,6 +534,8 @@ void RigidBodySolver::recompute_mass_properties(RigidBody &r_body, bool p_recent
 		r_body.inv_mass = 1.0f;
 		r_body.inertia = 1.0f;
 		r_body.inv_inertia = 1.0f;
+		r_body.local_min_x = r_body.local_min_y = 0.0f;
+		r_body.local_max_x = r_body.local_max_y = 0.0f;
 		return;
 	}
 
@@ -534,6 +559,18 @@ void RigidBodySolver::recompute_mass_properties(RigidBody &r_body, bool p_recent
 				c.ly -= cy;
 			}
 		}
+	}
+
+	constexpr float LOCAL_CELL_HALF_EXTENT = 0.52f;
+	r_body.local_min_x = std::numeric_limits<float>::max();
+	r_body.local_min_y = std::numeric_limits<float>::max();
+	r_body.local_max_x = std::numeric_limits<float>::lowest();
+	r_body.local_max_y = std::numeric_limits<float>::lowest();
+	for (const BodyCell &c : r_body.cells) {
+		r_body.local_min_x = std::min(r_body.local_min_x, c.lx - LOCAL_CELL_HALF_EXTENT);
+		r_body.local_min_y = std::min(r_body.local_min_y, c.ly - LOCAL_CELL_HALF_EXTENT);
+		r_body.local_max_x = std::max(r_body.local_max_x, c.lx + LOCAL_CELL_HALF_EXTENT);
+		r_body.local_max_y = std::max(r_body.local_max_y, c.ly + LOCAL_CELL_HALF_EXTENT);
 	}
 
 	r_body.mass = std::max(1.0f, static_cast<float>(r_body.cells.size()));
@@ -563,6 +600,65 @@ bool RigidBodySolver::raster_cell(const RigidBody &p_body, const BodyCell &p_cel
 	return true;
 }
 
+void RigidBodySolver::collect_body_covered_cells(const RigidBody &p_body, const WorldGrid *p_grid, const std::vector<int32_t> *p_indices, float p_half_extent, std::vector<CoveredCell> &r_cells) const {
+	r_cells.clear();
+	if (p_body.cells.empty()) {
+		return;
+	}
+	const float ca = std::cos(p_body.angle);
+	const float sa = std::sin(p_body.angle);
+	const float half = std::max(0.45f, p_half_extent);
+	const float extent_x = half * (std::abs(ca) + std::abs(sa)) + 0.001f;
+	const float extent_y = extent_x;
+	const int32_t count = p_indices == nullptr ? static_cast<int32_t>(p_body.cells.size()) : static_cast<int32_t>(p_indices->size());
+	r_cells.reserve(static_cast<size_t>(count * 2));
+
+	for (int32_t ii = 0; ii < count; ii++) {
+		const int32_t source_index = p_indices == nullptr ? ii : (*p_indices)[ii];
+		if (source_index < 0 || source_index >= static_cast<int32_t>(p_body.cells.size())) {
+			continue;
+		}
+		const BodyCell &cell = p_body.cells[source_index];
+		const float wx = p_body.x + ca * cell.lx - sa * cell.ly;
+		const float wy = p_body.y + sa * cell.lx + ca * cell.ly;
+		const int32_t min_x = static_cast<int32_t>(std::floor(wx - extent_x));
+		const int32_t max_x = static_cast<int32_t>(std::floor(wx + extent_x));
+		const int32_t min_y = static_cast<int32_t>(std::floor(wy - extent_y));
+		const int32_t max_y = static_cast<int32_t>(std::floor(wy + extent_y));
+
+		for (int32_t y = min_y; y <= max_y; y++) {
+			for (int32_t x = min_x; x <= max_x; x++) {
+				if (p_grid != nullptr && !p_grid->in_bounds(x, y)) {
+					continue;
+				}
+				const float dx = (static_cast<float>(x) + 0.5f) - wx;
+				const float dy = (static_cast<float>(y) + 0.5f) - wy;
+				const float local_x = ca * dx + sa * dy;
+				const float local_y = -sa * dx + ca * dy;
+				if (std::abs(local_x) > half || std::abs(local_y) > half) {
+					continue;
+				}
+				CoveredCell covered;
+				covered.x = x;
+				covered.y = y;
+				covered.source_index = source_index;
+				covered.key = grid_cell_key(x, y);
+				r_cells.push_back(covered);
+			}
+		}
+	}
+
+	std::sort(r_cells.begin(), r_cells.end(), [](const CoveredCell &a, const CoveredCell &b) {
+		if (a.key != b.key) {
+			return a.key < b.key;
+		}
+		return a.source_index < b.source_index;
+	});
+	r_cells.erase(std::unique(r_cells.begin(), r_cells.end(), [](const CoveredCell &a, const CoveredCell &b) {
+		return a.key == b.key;
+	}), r_cells.end());
+}
+
 void RigidBodySolver::update_body_aabb(RigidBody &r_body) const {
 	if (r_body.cells.empty()) {
 		r_body.min_x = r_body.max_x = static_cast<int32_t>(std::floor(r_body.x));
@@ -577,15 +673,32 @@ void RigidBodySolver::update_body_aabb(RigidBody &r_body) const {
 	r_body.min_y = std::numeric_limits<int32_t>::max();
 	r_body.max_x = std::numeric_limits<int32_t>::min();
 	r_body.max_y = std::numeric_limits<int32_t>::min();
-	for (const BodyCell &c : r_body.cells) {
-		int32_t x = 0;
-		int32_t y = 0;
-		raster_cell(r_body, c, x, y);
-		r_body.min_x = std::min(r_body.min_x, x);
-		r_body.min_y = std::min(r_body.min_y, y);
-		r_body.max_x = std::max(r_body.max_x, x);
-		r_body.max_y = std::max(r_body.max_y, y);
+
+	const float ca = std::cos(r_body.angle);
+	const float sa = std::sin(r_body.angle);
+	const float xs[2] = { r_body.local_min_x, r_body.local_max_x };
+	const float ys[2] = { r_body.local_min_y, r_body.local_max_y };
+	float min_x = std::numeric_limits<float>::max();
+	float min_y = std::numeric_limits<float>::max();
+	float max_x = std::numeric_limits<float>::lowest();
+	float max_y = std::numeric_limits<float>::lowest();
+	for (float lx : xs) {
+		for (float ly : ys) {
+			const float wx = r_body.x + ca * lx - sa * ly;
+			const float wy = r_body.y + sa * lx + ca * ly;
+			min_x = std::min(min_x, wx);
+			min_y = std::min(min_y, wy);
+			max_x = std::max(max_x, wx);
+			max_y = std::max(max_y, wy);
+		}
 	}
+	// The local bounds already include the conservative per-pixel half extent.
+	// Pad by one grid cell because rasterization tests pixel centers and because
+	// broad-phase false positives are much cheaper than missed contacts.
+	r_body.min_x = static_cast<int32_t>(std::floor(min_x)) - 1;
+	r_body.min_y = static_cast<int32_t>(std::floor(min_y)) - 1;
+	r_body.max_x = static_cast<int32_t>(std::floor(max_x)) + 1;
+	r_body.max_y = static_cast<int32_t>(std::floor(max_y)) + 1;
 	r_body.wake_min_x = r_body.min_x - wake_aabb_padding;
 	r_body.wake_min_y = r_body.min_y - wake_aabb_padding;
 	r_body.wake_max_x = r_body.max_x + wake_aabb_padding;
@@ -697,7 +810,306 @@ void RigidBodySolver::collect_contacts(const WorldGrid &p_grid, const RigidBody 
 	}
 }
 
-void RigidBodySolver::collect_static_chunk_contacts(const RigidBody &p_body, const StaticCollisionChunk &p_chunk, std::vector<Contact> &r_contacts) const {
+void RigidBodySolver::build_body_cell_hash(const RigidBody &p_body, std::vector<int64_t> &r_keys) const {
+	r_keys.clear();
+	std::vector<CoveredCell> covered;
+	collect_body_covered_cells(p_body, nullptr, nullptr, 0.52f, covered);
+	r_keys.reserve(covered.size());
+	for (const CoveredCell &c : covered) {
+		r_keys.push_back(c.key);
+	}
+	std::sort(r_keys.begin(), r_keys.end());
+	r_keys.erase(std::unique(r_keys.begin(), r_keys.end()), r_keys.end());
+}
+
+bool RigidBodySolver::boundary_overlaps_body_cells(const RigidBody &p_boundary_body, const RigidBody &p_solid_body, const std::vector<int64_t> *p_solid_keys, int32_t *r_overlap_count) const {
+	if (r_overlap_count != nullptr) {
+		*r_overlap_count = 0;
+	}
+	if (p_boundary_body.boundary_indices.empty() || p_solid_body.cells.empty()) {
+		return false;
+	}
+
+	std::vector<int64_t> local_keys;
+	const std::vector<int64_t> *keys = p_solid_keys;
+	if (keys == nullptr) {
+		build_body_cell_hash(p_solid_body, local_keys);
+		keys = &local_keys;
+	}
+	if (keys->empty()) {
+		return false;
+	}
+
+	int32_t overlaps = 0;
+	std::vector<CoveredCell> boundary_cells;
+	collect_body_covered_cells(p_boundary_body, nullptr, &p_boundary_body.boundary_indices, 0.52f, boundary_cells);
+	for (const CoveredCell &c : boundary_cells) {
+		if (std::binary_search(keys->begin(), keys->end(), c.key)) {
+			overlaps++;
+			if (r_overlap_count == nullptr) {
+				return true;
+			}
+		}
+	}
+	if (r_overlap_count != nullptr) {
+		*r_overlap_count = overlaps;
+	}
+	return overlaps > 0;
+}
+
+bool RigidBodySolver::boundary_overlaps_static(const WorldGrid &p_grid, const RigidBody &p_body, int32_t *r_overlap_count) const {
+	if (r_overlap_count != nullptr) {
+		*r_overlap_count = 0;
+	}
+	int32_t overlaps = 0;
+	std::vector<CoveredCell> boundary_cells;
+	collect_body_covered_cells(p_body, &p_grid, &p_body.boundary_indices, 0.52f, boundary_cells);
+	for (const CoveredCell &c : boundary_cells) {
+		if (static_solid_or_boundary(p_grid, c.x, c.y)) {
+			overlaps++;
+			if (r_overlap_count == nullptr) {
+				return true;
+			}
+		}
+	}
+	if (r_overlap_count != nullptr) {
+		*r_overlap_count = overlaps;
+	}
+	return overlaps > 0;
+}
+
+bool RigidBodySolver::has_overlap_blocking_sleep(const WorldGrid &p_grid, const RigidBody &p_body) {
+	int32_t static_overlap_count = 0;
+	if (boundary_overlaps_static(p_grid, p_body, &static_overlap_count) && static_overlap_count > SLEEP_BLOCKING_OVERLAP_CELLS) {
+		return true;
+	}
+
+	auto overlaps_candidate = [&](const RigidBody *other) -> bool {
+		if (other == nullptr || !other->active || other->id == p_body.id) {
+			return false;
+		}
+		if (p_body.max_x < other->min_x || other->max_x < p_body.min_x ||
+				p_body.max_y < other->min_y || other->max_y < p_body.min_y) {
+			return false;
+		}
+		int32_t overlap_count = 0;
+		return boundary_overlaps_body_cells(p_body, *other, nullptr, &overlap_count) && overlap_count > SLEEP_BLOCKING_OVERLAP_CELLS;
+	};
+
+	for (const BodyPair &pair : active_body_pairs) {
+		if (pair.a_id == p_body.id) {
+			if (overlaps_candidate(find_body_by_id(pair.b_id))) {
+				return true;
+			}
+		} else if (pair.b_id == p_body.id) {
+			if (overlaps_candidate(find_body_by_id(pair.a_id))) {
+				return true;
+			}
+		}
+	}
+
+	if (sleeping_buckets_dirty) {
+		rebuild_sleeping_body_buckets();
+	}
+	const int32_t bs = std::max(4, broad_phase_cell_size);
+	const int32_t min_bx = static_cast<int32_t>(std::floor(static_cast<float>(p_body.min_x - 1) / static_cast<float>(bs)));
+	const int32_t max_bx = static_cast<int32_t>(std::floor(static_cast<float>(p_body.max_x + 1) / static_cast<float>(bs)));
+	const int32_t min_by = static_cast<int32_t>(std::floor(static_cast<float>(p_body.min_y - 1) / static_cast<float>(bs)));
+	const int32_t max_by = static_cast<int32_t>(std::floor(static_cast<float>(p_body.max_y + 1) / static_cast<float>(bs)));
+	std::vector<int32_t> checked_ids;
+	for (int32_t by = min_by; by <= max_by; by++) {
+		for (int32_t bx = min_bx; bx <= max_bx; bx++) {
+			const int64_t key = grid_cell_key(bx, by);
+			auto it = std::lower_bound(sleeping_bucket_keys.begin(), sleeping_bucket_keys.end(), key);
+			for (; it != sleeping_bucket_keys.end() && *it == key; ++it) {
+				const int32_t idx = static_cast<int32_t>(it - sleeping_bucket_keys.begin());
+				const int32_t other_id = sleeping_bucket_body_ids[idx];
+				if (other_id == p_body.id || std::find(checked_ids.begin(), checked_ids.end(), other_id) != checked_ids.end()) {
+					continue;
+				}
+				checked_ids.push_back(other_id);
+				const RigidBody *other = find_body_by_id(other_id);
+				if (other == nullptr || !other->sleeping) {
+					continue;
+				}
+				if (overlaps_candidate(other)) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+void RigidBodySolver::add_body_overlap_contacts(const RigidBody &p_boundary_body, const RigidBody &p_solid_body, bool p_normal_b_to_a, const std::vector<int64_t> &p_solid_keys, std::vector<Contact> &r_contacts) const {
+	if (p_boundary_body.boundary_indices.empty() || p_solid_keys.empty()) {
+		return;
+	}
+	const size_t start_count = r_contacts.size();
+	int32_t overlap_count = 0;
+	float sum_x = 0.0f;
+	float sum_y = 0.0f;
+	const int32_t max_extra_contacts = 16;
+
+	std::vector<CoveredCell> boundary_cells;
+	collect_body_covered_cells(p_boundary_body, nullptr, &p_boundary_body.boundary_indices, 0.52f, boundary_cells);
+	for (const CoveredCell &covered : boundary_cells) {
+		if (!std::binary_search(p_solid_keys.begin(), p_solid_keys.end(), covered.key)) {
+			continue;
+		}
+		const float wx = static_cast<float>(covered.x) + 0.5f;
+		const float wy = static_cast<float>(covered.y) + 0.5f;
+		overlap_count++;
+		sum_x += wx;
+		sum_y += wy;
+		if (static_cast<int32_t>(r_contacts.size() - start_count) < max_extra_contacts) {
+			Contact c;
+			c.px = wx;
+			c.py = wy;
+			float nx = p_normal_b_to_a ? (p_boundary_body.x - p_solid_body.x) : (p_solid_body.x - p_boundary_body.x);
+			float ny = p_normal_b_to_a ? (p_boundary_body.y - p_solid_body.y) : (p_solid_body.y - p_boundary_body.y);
+			float len = std::sqrt(nx * nx + ny * ny);
+			if (len < 0.0001f) {
+				nx = p_normal_b_to_a ? (wx - p_solid_body.x) : (p_solid_body.x - wx);
+				ny = p_normal_b_to_a ? (wy - p_solid_body.y) : (p_solid_body.y - wy);
+				len = std::sqrt(nx * nx + ny * ny);
+			}
+			if (len < 0.0001f) {
+				nx = 1.0f;
+				ny = 0.0f;
+				len = 1.0f;
+			}
+			c.nx = nx / len;
+			c.ny = ny / len;
+			c.penetration = 0.75f;
+			r_contacts.push_back(c);
+		}
+	}
+
+	if (overlap_count > 0) {
+		Contact c;
+		c.px = sum_x / static_cast<float>(overlap_count);
+		c.py = sum_y / static_cast<float>(overlap_count);
+		float nx = p_normal_b_to_a ? (p_boundary_body.x - p_solid_body.x) : (p_solid_body.x - p_boundary_body.x);
+		float ny = p_normal_b_to_a ? (p_boundary_body.y - p_solid_body.y) : (p_solid_body.y - p_boundary_body.y);
+		float len = std::sqrt(nx * nx + ny * ny);
+		if (len < 0.0001f) {
+			nx = p_normal_b_to_a ? (c.px - p_solid_body.x) : (p_solid_body.x - c.px);
+			ny = p_normal_b_to_a ? (c.py - p_solid_body.y) : (p_solid_body.y - c.py);
+			len = std::sqrt(nx * nx + ny * ny);
+		}
+		if (len < 0.0001f) {
+			nx = 1.0f;
+			ny = 0.0f;
+			len = 1.0f;
+		}
+		c.nx = nx / len;
+		c.ny = ny / len;
+		// Overlap count approximates "overlap area" without all-cell pairwise
+		// checks. Feed it mostly into positional correction, capped to avoid
+		// explosive impulses when two chunks are deeply embedded.
+		c.penetration = clampf(0.65f + 0.045f * std::sqrt(static_cast<float>(overlap_count)), 0.65f, 1.65f);
+		r_contacts.push_back(c);
+	}
+}
+
+void RigidBodySolver::add_static_overlap_contacts(const WorldGrid &p_grid, const RigidBody &p_body, const StaticCollisionChunk &p_chunk, std::vector<Contact> &r_contacts) const {
+	const size_t start_count = r_contacts.size();
+	int32_t overlap_count = 0;
+	float sum_x = 0.0f;
+	float sum_y = 0.0f;
+	float sum_nx = 0.0f;
+	float sum_ny = 0.0f;
+	const int32_t max_extra_contacts = 16;
+	std::vector<CoveredCell> boundary_cells;
+	collect_body_covered_cells(p_body, &p_grid, &p_body.boundary_indices, 0.52f, boundary_cells);
+	for (const CoveredCell &covered : boundary_cells) {
+		const int32_t x = covered.x;
+		const int32_t y = covered.y;
+		if (x < p_chunk.min_x - 1 || x > p_chunk.max_x + 1 || y < p_chunk.min_y - 1 || y > p_chunk.max_y + 1) {
+			continue;
+		}
+		if (!static_solid_or_boundary(p_grid, x, y)) {
+			continue;
+		}
+		const float wx = static_cast<float>(x) + 0.5f;
+		const float wy = static_cast<float>(y) + 0.5f;
+		const float rx = wx - p_body.x;
+		const float ry = wy - p_body.y;
+		const float fallback_vx = p_body.vx - p_body.angular_velocity * ry;
+		const float fallback_vy = p_body.vy + p_body.angular_velocity * rx;
+		float nx = 0.0f;
+		float ny = -1.0f;
+		estimate_contact_normal(p_grid, x, y, wx, wy, fallback_vx, fallback_vy, nx, ny);
+
+		// If the boundary point is already deep inside a raster solid, the
+		// immediate 4-neighbor gradient can be zero or point in a poor fallback
+		// direction. Search for the nearest open cell and use the direction from
+		// solid to open as a stronger depenetration normal.
+		float escape_nx = nx;
+		float escape_ny = ny;
+		float best_score = 999999.0f;
+		const int32_t dirs[8][2] = {
+			{ 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 },
+			{ -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 },
+		};
+		for (int32_t dist = 1; dist <= 10; dist++) {
+			for (const auto &dir : dirs) {
+				const int32_t tx = x + dir[0] * dist;
+				const int32_t ty = y + dir[1] * dist;
+				if (static_solid_or_boundary(p_grid, tx, ty)) {
+					continue;
+				}
+				const float diag_penalty = (dir[0] != 0 && dir[1] != 0) ? 0.41f : 0.0f;
+				const float score = static_cast<float>(dist) + diag_penalty;
+				if (score < best_score) {
+					best_score = score;
+					escape_nx = static_cast<float>(dir[0]);
+					escape_ny = static_cast<float>(dir[1]);
+				}
+			}
+			if (best_score < 999999.0f) {
+				break;
+			}
+		}
+		float escape_len = std::sqrt(escape_nx * escape_nx + escape_ny * escape_ny);
+		if (escape_len > 0.0001f) {
+			nx = escape_nx / escape_len;
+			ny = escape_ny / escape_len;
+		}
+		overlap_count++;
+		sum_x += wx;
+		sum_y += wy;
+		sum_nx += nx;
+		sum_ny += ny;
+		if (static_cast<int32_t>(r_contacts.size() - start_count) < max_extra_contacts) {
+			Contact c;
+			c.px = wx;
+			c.py = wy;
+			c.nx = nx;
+			c.ny = ny;
+			c.penetration = 1.15f;
+			r_contacts.push_back(c);
+		}
+	}
+	if (overlap_count > 0) {
+		Contact c;
+		c.px = sum_x / static_cast<float>(overlap_count);
+		c.py = sum_y / static_cast<float>(overlap_count);
+		float len = std::sqrt(sum_nx * sum_nx + sum_ny * sum_ny);
+		if (len < 0.0001f) {
+			c.nx = 0.0f;
+			c.ny = -1.0f;
+		} else {
+			c.nx = sum_nx / len;
+			c.ny = sum_ny / len;
+		}
+		c.penetration = clampf(1.10f + 0.12f * std::sqrt(static_cast<float>(overlap_count)), 1.10f, 4.00f);
+		r_contacts.push_back(c);
+	}
+}
+
+void RigidBodySolver::collect_static_chunk_contacts(const WorldGrid &p_grid, const RigidBody &p_body, const StaticCollisionChunk &p_chunk, std::vector<Contact> &r_contacts) const {
 	r_contacts.clear();
 	if (!p_chunk.has_solid || p_chunk.samples.empty()) {
 		return;
@@ -754,6 +1166,7 @@ void RigidBodySolver::collect_static_chunk_contacts(const RigidBody &p_body, con
 			break;
 		}
 	}
+	add_static_overlap_contacts(p_grid, p_body, p_chunk, r_contacts);
 }
 
 void RigidBodySolver::resolve_contacts(RigidBody &r_body, const std::vector<Contact> &p_contacts) {
@@ -816,16 +1229,17 @@ void RigidBodySolver::resolve_contacts(RigidBody &r_body, const std::vector<Cont
 	}
 }
 
-void RigidBodySolver::resolve_static_pair_contacts(RigidBody &r_body, const StaticCollisionChunk &p_chunk) {
+void RigidBodySolver::resolve_static_pair_contacts(const WorldGrid &p_grid, RigidBody &r_body, const StaticCollisionChunk &p_chunk) {
 	if (!r_body.active || r_body.sleeping || !p_chunk.has_solid) {
 		return;
 	}
 	std::vector<Contact> contacts;
 	for (int32_t iter = 0; iter < std::max(1, collision_iterations); iter++) {
-		collect_static_chunk_contacts(r_body, p_chunk, contacts);
+		collect_static_chunk_contacts(p_grid, r_body, p_chunk, contacts);
 		if (contacts.empty()) {
 			break;
 		}
+		r_body.had_contact = true;
 		resolve_contacts(r_body, contacts);
 		update_body_aabb(r_body);
 	}
@@ -839,14 +1253,7 @@ void RigidBodySolver::resolve_body_pair_contacts(RigidBody &r_a, RigidBody &r_b)
 		return;
 	}
 
-	struct PairContact {
-		float px = 0.0f;
-		float py = 0.0f;
-		float nx = 1.0f; // from body B toward body A
-		float ny = 0.0f;
-		float penetration = 0.5f;
-	};
-	std::vector<PairContact> contacts;
+	std::vector<Contact> contacts;
 	contacts.reserve(16);
 
 	const std::vector<int32_t> &samples_a = r_a.collision_sample_indices.empty() ? r_a.boundary_indices : r_a.collision_sample_indices;
@@ -903,31 +1310,31 @@ void RigidBodySolver::resolve_body_pair_contacts(RigidBody &r_a, RigidBody &r_b)
 					continue;
 				}
 				const BodySampleWorld &bs = it->sample;
-			PairContact c;
-			c.px = 0.5f * (ax + bs.wx);
-			c.py = 0.5f * (ay + bs.wy);
-			float nx = ax - bs.wx;
-			float ny = ay - bs.wy;
-			float len = std::sqrt(nx * nx + ny * ny);
-			if (len < 0.0001f) {
-				nx = r_a.x - r_b.x;
-				ny = r_a.y - r_b.y;
-				len = std::sqrt(nx * nx + ny * ny);
-			}
-			if (len < 0.0001f) {
-				nx = 1.0f;
-				ny = 0.0f;
-				len = 1.0f;
-			}
-			c.nx = nx / len;
-			c.ny = ny / len;
-			c.penetration = (ox == 0 && oy == 0) ? 0.65f : 0.28f;
-			contacts.push_back(c);
+				Contact c;
+				c.px = 0.5f * (ax + bs.wx);
+				c.py = 0.5f * (ay + bs.wy);
+				float nx = ax - bs.wx;
+				float ny = ay - bs.wy;
+				float len = std::sqrt(nx * nx + ny * ny);
+				if (len < 0.0001f) {
+					nx = r_a.x - r_b.x;
+					ny = r_a.y - r_b.y;
+					len = std::sqrt(nx * nx + ny * ny);
+				}
+				if (len < 0.0001f) {
+					nx = 1.0f;
+					ny = 0.0f;
+					len = 1.0f;
+				}
+				c.nx = nx / len;
+				c.ny = ny / len;
+				c.penetration = (ox == 0 && oy == 0) ? 0.65f : 0.28f;
+				contacts.push_back(c);
 				found = true;
-			if (contacts.size() >= 24) {
-				break;
+				if (contacts.size() >= 24) {
+					break;
+				}
 			}
-		}
 			if (found || contacts.size() >= 24) {
 				break;
 			}
@@ -937,18 +1344,41 @@ void RigidBodySolver::resolve_body_pair_contacts(RigidBody &r_a, RigidBody &r_b)
 		}
 	}
 
+	std::vector<int64_t> a_full_keys;
+	std::vector<int64_t> b_full_keys;
+	build_body_cell_hash(r_a, a_full_keys);
+	build_body_cell_hash(r_b, b_full_keys);
+	// Add robust deep-overlap contacts: full boundary of one body against all
+	// occupied cells of the other body. This catches cases missed by the cheap
+	// sampled-boundary narrow phase without degenerating to all-cells vs all-cells.
+	add_body_overlap_contacts(r_a, r_b, true, b_full_keys, contacts);
+	add_body_overlap_contacts(r_b, r_a, false, a_full_keys, contacts);
+
 	if (contacts.empty()) {
 		return;
 	}
-	if (r_a.sleeping || r_b.sleeping) {
+	r_a.had_contact = true;
+	r_b.had_contact = true;
+
+	const bool a_was_sleeping = r_a.sleeping;
+	const bool b_was_sleeping = r_b.sleeping;
+	const float speed_a = std::sqrt(r_a.vx * r_a.vx + r_a.vy * r_a.vy);
+	const float speed_b = std::sqrt(r_b.vx * r_b.vx + r_b.vy * r_b.vy);
+	const bool a_can_wake_b = speed_a > settle_speed * 1.5f || std::abs(r_a.angular_velocity) > settle_angular_speed * 1.5f;
+	const bool b_can_wake_a = speed_b > settle_speed * 1.5f || std::abs(r_b.angular_velocity) > settle_angular_speed * 1.5f;
+	if ((a_was_sleeping && b_can_wake_a) || (b_was_sleeping && a_can_wake_b)) {
 		sleeping_buckets_dirty = true;
 	}
-	r_a.sleeping = false;
-	r_b.sleeping = false;
-	r_a.still_time = 0.0f;
-	r_b.still_time = 0.0f;
+	if (a_was_sleeping && b_can_wake_a) {
+		r_a.sleeping = false;
+		r_a.still_time = 0.0f;
+	}
+	if (b_was_sleeping && a_can_wake_b) {
+		r_b.sleeping = false;
+		r_b.still_time = 0.0f;
+	}
 
-	for (const PairContact &c : contacts) {
+	for (const Contact &c : contacts) {
 		const float rax = c.px - r_a.x;
 		const float ray = c.py - r_a.y;
 		const float rbx = c.px - r_b.x;
@@ -1003,7 +1433,7 @@ void RigidBodySolver::resolve_body_pair_contacts(RigidBody &r_a, RigidBody &r_b)
 
 	float push_x = 0.0f;
 	float push_y = 0.0f;
-	for (const PairContact &c : contacts) {
+	for (const Contact &c : contacts) {
 		const float correction = std::max(0.0f, c.penetration - collision_slop);
 		push_x += c.nx * correction;
 		push_y += c.ny * correction;
@@ -1018,7 +1448,7 @@ void RigidBodySolver::resolve_body_pair_contacts(RigidBody &r_a, RigidBody &r_b)
 	update_body_aabb(r_b);
 }
 
-void RigidBodySolver::resolve_dynamic_body_contacts() {
+void RigidBodySolver::resolve_dynamic_body_contacts(const WorldGrid &p_grid) {
 	for (int32_t iter = 0; iter < std::max(1, collision_iterations); iter++) {
 		for (const BodyPair &pair : active_body_pairs) {
 			RigidBody *a = find_body_by_id(pair.a_id);
@@ -1034,26 +1464,36 @@ void RigidBodySolver::resolve_dynamic_body_contacts() {
 		if (body == nullptr || pair.chunk_index < 0 || pair.chunk_index >= static_cast<int32_t>(static_chunks.size())) {
 			continue;
 		}
-		resolve_static_pair_contacts(*body, static_chunks[pair.chunk_index]);
+		resolve_static_pair_contacts(p_grid, *body, static_chunks[pair.chunk_index]);
 	}
 }
 
 RigidBodySolver::RigidBody *RigidBodySolver::find_body_by_id(int32_t p_id) {
-	for (RigidBody &body : bodies) {
-		if (body.id == p_id && body.active) {
-			return &body;
-		}
+	rebuild_body_index_map();
+	auto it = body_index_by_id.find(p_id);
+	if (it == body_index_by_id.end()) {
+		return nullptr;
 	}
-	return nullptr;
+	const int32_t idx = it->second;
+	if (idx < 0 || idx >= static_cast<int32_t>(bodies.size()) || !bodies[idx].active || bodies[idx].id != p_id) {
+		body_index_dirty = true;
+		return nullptr;
+	}
+	return &bodies[idx];
 }
 
 const RigidBodySolver::RigidBody *RigidBodySolver::find_body_by_id(int32_t p_id) const {
-	for (const RigidBody &body : bodies) {
-		if (body.id == p_id && body.active) {
-			return &body;
-		}
+	rebuild_body_index_map();
+	auto it = body_index_by_id.find(p_id);
+	if (it == body_index_by_id.end()) {
+		return nullptr;
 	}
-	return nullptr;
+	const int32_t idx = it->second;
+	if (idx < 0 || idx >= static_cast<int32_t>(bodies.size()) || !bodies[idx].active || bodies[idx].id != p_id) {
+		body_index_dirty = true;
+		return nullptr;
+	}
+	return &bodies[idx];
 }
 
 bool RigidBodySolver::aabb_overlap_expanded(const RigidBody &p_a, const RigidBody &p_b, int32_t p_padding) const {
@@ -1163,9 +1603,6 @@ void RigidBodySolver::rebuild_broad_phase_pairs(const WorldGrid &p_grid) {
 							body.max_y < other->wake_min_y || body.min_y > other->wake_max_y) {
 						continue;
 					}
-					other->sleeping = false;
-					other->still_time = 0.0f;
-					sleeping_buckets_dirty = true;
 					add_body_pair_key(body.id, other->id);
 				}
 			}
@@ -1205,10 +1642,18 @@ void RigidBodySolver::rebuild_broad_phase_pairs(const WorldGrid &p_grid) {
 	}
 }
 
-void RigidBodySolver::update_sleep_state(RigidBody &r_body, bool p_had_contact) {
+void RigidBodySolver::update_sleep_state(const WorldGrid &p_grid, RigidBody &r_body, bool p_had_contact) {
 	const float speed = std::sqrt(r_body.vx * r_body.vx + r_body.vy * r_body.vy);
-	if (p_had_contact && speed < settle_speed && std::abs(r_body.angular_velocity) < settle_angular_speed) {
-		r_body.still_time += fixed_step_seconds;
+	const bool has_rest_support = p_had_contact || body_has_support(p_grid, r_body);
+	if (has_rest_support && speed < settle_speed && std::abs(r_body.angular_velocity) < settle_angular_speed) {
+		if (has_overlap_blocking_sleep(p_grid, r_body)) {
+			// A sampled narrow phase can leave two pixel chunks slightly
+			// interpenetrating. Do not freeze that configuration; keep it awake
+			// until the full-boundary overlap test says it is separated.
+			r_body.still_time = 0.0f;
+		} else {
+			r_body.still_time += fixed_step_seconds;
+		}
 	} else {
 		r_body.still_time = 0.0f;
 	}
@@ -1225,7 +1670,7 @@ void RigidBodySolver::update_sleep_state(RigidBody &r_body, bool p_had_contact) 
 }
 
 bool RigidBodySolver::body_has_support(const WorldGrid &p_grid, const RigidBody &p_body) const {
-	const std::vector<int32_t> &samples = p_body.collision_sample_indices.empty() ? p_body.boundary_indices : p_body.collision_sample_indices;
+	const std::vector<int32_t> &samples = p_body.boundary_indices;
 	if (samples.empty()) {
 		return false;
 	}
@@ -1241,8 +1686,7 @@ bool RigidBodySolver::body_has_support(const WorldGrid &p_grid, const RigidBody 
 		if (support_body_id == 0 || support_body_id == p_body.id) {
 			return false;
 		}
-		const RigidBody *support_body = find_body_by_id(support_body_id);
-		return support_body != nullptr && support_body->sleeping;
+		return find_body_by_id(support_body_id) != nullptr;
 	};
 	for (int32_t sample_index : samples) {
 		if (sample_index < 0 || sample_index >= static_cast<int32_t>(p_body.cells.size())) {
@@ -1386,22 +1830,17 @@ bool RigidBodySolver::displace_cell_from_rigid(WorldGrid &p_grid, int32_t p_x, i
 
 void RigidBodySolver::populate_dynamic_cells(WorldGrid &p_grid) {
 	p_grid.clear_rigid_fields();
+	std::vector<CoveredCell> covered;
 	for (const RigidBody &body : bodies) {
 		if (!body.active) {
 			continue;
 		}
-		const float ca = std::cos(body.angle);
-		const float sa = std::sin(body.angle);
-		for (const BodyCell &c : body.cells) {
-			const float rx = ca * c.lx - sa * c.ly;
-			const float ry = sa * c.lx + ca * c.ly;
-			const float wx = body.x + rx;
-			const float wy = body.y + ry;
-			const int32_t x = static_cast<int32_t>(std::floor(wx));
-			const int32_t y = static_cast<int32_t>(std::floor(wy));
-			if (!p_grid.in_bounds(x, y)) {
-				continue;
-			}
+		collect_body_covered_cells(body, &p_grid, nullptr, 0.52f, covered);
+		for (const CoveredCell &c : covered) {
+			const int32_t x = c.x;
+			const int32_t y = c.y;
+			const float rx = (static_cast<float>(x) + 0.5f) - body.x;
+			const float ry = (static_cast<float>(y) + 0.5f) - body.y;
 			const float cvx = body.vx - body.angular_velocity * ry;
 			const float cvy = body.vy + body.angular_velocity * rx;
 			displace_cell_from_rigid(p_grid, x, y, cvx, cvy);
@@ -1416,6 +1855,9 @@ void RigidBodySolver::populate_dynamic_cells(WorldGrid &p_grid) {
 void RigidBodySolver::step(WorldGrid &p_grid) {
 	if (auto_process_dirty) {
 		process_dirty(p_grid);
+	}
+	for (RigidBody &body : bodies) {
+		body.had_contact = false;
 	}
 	for (RigidBody &body : bodies) {
 		if (!body.active || body.id == dragged_body) {
@@ -1440,30 +1882,19 @@ void RigidBodySolver::step(WorldGrid &p_grid) {
 		broad_phase_counter = std::max(1, broad_phase_interval_steps);
 	}
 
-	resolve_dynamic_body_contacts();
+	resolve_dynamic_body_contacts(p_grid);
 
 	for (RigidBody &body : bodies) {
 		if (!body.active || body.sleeping || body.id == dragged_body) {
 			continue;
 		}
-		bool near_contact = false;
-		for (const StaticPair &p : active_static_pairs) {
-			if (p.body_id == body.id) {
-				near_contact = true;
-				break;
-			}
-		}
-		if (!near_contact) {
-			for (const BodyPair &p : active_body_pairs) {
-				if (p.a_id == body.id || p.b_id == body.id) {
-					near_contact = true;
-					break;
-				}
-			}
-		}
-		update_sleep_state(body, near_contact);
+		update_sleep_state(p_grid, body, body.had_contact);
 	}
+	const size_t before_count = bodies.size();
 	bodies.erase(std::remove_if(bodies.begin(), bodies.end(), [](const RigidBody &b) { return !b.active; }), bodies.end());
+	if (bodies.size() != before_count) {
+		mark_body_index_dirty();
+	}
 	populate_dynamic_cells(p_grid);
 }
 
@@ -1512,7 +1943,11 @@ void RigidBodySolver::destroy_circle(WorldGrid &p_grid, float p_x, float p_y, fl
 			body.angular_velocity *= 0.8f;
 		}
 	}
+	const size_t before_count = bodies.size();
 	bodies.erase(std::remove_if(bodies.begin(), bodies.end(), [](const RigidBody &b) { return !b.active; }), bodies.end());
+	if (bodies.size() != before_count) {
+		mark_body_index_dirty();
+	}
 	mark_dirty_rect(p_grid,
 			static_cast<int32_t>(std::floor(p_x - p_radius)) - 1,
 			static_cast<int32_t>(std::floor(p_y - p_radius)) - 1,
@@ -1567,6 +2002,7 @@ void RigidBodySolver::spawn_collision_test(WorldGrid &p_grid) {
 		rebuild_boundary_samples(body);
 		update_body_aabb(body);
 		bodies.push_back(std::move(body));
+		mark_body_index_dirty();
 	};
 
 	const float cy = static_cast<float>(p_grid.height) * 0.38f;
@@ -1579,24 +2015,24 @@ void RigidBodySolver::draw_overlay_rgba(const WorldGrid &p_grid, std::vector<uin
 	if (r_pixels.empty()) {
 		return;
 	}
+	std::vector<CoveredCell> covered;
 	for (const RigidBody &body : bodies) {
 		if (!body.active) {
 			continue;
 		}
-		for (const BodyCell &c : body.cells) {
-			int32_t x = 0;
-			int32_t y = 0;
-			raster_cell(body, c, x, y);
-			if (!p_grid.in_bounds(x, y)) {
+		collect_body_covered_cells(body, &p_grid, nullptr, 0.52f, covered);
+		for (const CoveredCell &cell : covered) {
+			if (cell.source_index < 0 || cell.source_index >= static_cast<int32_t>(body.cells.size())) {
 				continue;
 			}
-			const int32_t p = p_grid.cell_index(x, y) * 4;
-			if (c.material == MATERIAL_GLASS) {
+			const BodyCell &source = body.cells[cell.source_index];
+			const int32_t p = p_grid.cell_index(cell.x, cell.y) * 4;
+			if (source.material == MATERIAL_GLASS) {
 				r_pixels[p + 0] = 115;
 				r_pixels[p + 1] = 170;
 				r_pixels[p + 2] = 195;
 			} else {
-				const uint8_t shade = rock_shade(x, y, 70);
+				const uint8_t shade = rock_shade(static_cast<int32_t>(std::llround(source.lx * 4.0f)), static_cast<int32_t>(std::llround(source.ly * 4.0f)), 70);
 				r_pixels[p + 0] = shade;
 				r_pixels[p + 1] = shade;
 				r_pixels[p + 2] = static_cast<uint8_t>(std::min<int32_t>(255, shade + 10));
@@ -1614,11 +2050,10 @@ int32_t RigidBodySolver::find_body_at(float p_x, float p_y) const {
 		if (!body.active || gx < body.min_x - 1 || gx > body.max_x + 1 || gy < body.min_y - 1 || gy > body.max_y + 1) {
 			continue;
 		}
-		for (const BodyCell &c : body.cells) {
-			int32_t x = 0;
-			int32_t y = 0;
-			raster_cell(body, c, x, y);
-			if (x == gx && y == gy) {
+		std::vector<CoveredCell> covered;
+		collect_body_covered_cells(body, nullptr, nullptr, 0.52f, covered);
+		for (const CoveredCell &c : covered) {
+			if (c.x == gx && c.y == gy) {
 				return body.id;
 			}
 		}
@@ -1686,4 +2121,24 @@ void RigidBodySolver::end_drag() {
 
 int32_t RigidBodySolver::get_body_count() const {
 	return static_cast<int32_t>(bodies.size());
+}
+
+int32_t RigidBodySolver::get_awake_body_count() const {
+	int32_t count = 0;
+	for (const RigidBody &body : bodies) {
+		if (body.active && !body.sleeping) {
+			count++;
+		}
+	}
+	return count;
+}
+
+int32_t RigidBodySolver::get_sleeping_body_count() const {
+	int32_t count = 0;
+	for (const RigidBody &body : bodies) {
+		if (body.active && body.sleeping) {
+			count++;
+		}
+	}
+	return count;
 }

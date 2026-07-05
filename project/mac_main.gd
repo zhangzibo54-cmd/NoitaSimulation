@@ -285,10 +285,19 @@ func _update_info() -> void:
 
 	var text := "MacWorld: MAC grid + explicit advection/viscosity + PCG pressure projection\n"
 	text += "FPS: %d | target sim: %.0f steps/s | total sim steps: %d | last step: %.3f ms\n" % [int(Engine.get_frames_per_second()), 60.0 * world.get_simulation_speed(), world.get_step_count(), world.get_last_step_ms()]
+	if world.has_method("get_last_sim_ms"):
+		var frame_steps: int = 1
+		var frame_sim_ms: float = float(world.get_last_sim_ms())
+		if world.has_method("get_last_frame_sim_steps"):
+			frame_steps = int(world.get_last_frame_sim_steps())
+			frame_sim_ms = float(world.get_last_frame_sim_ms())
+		text += "timing: sim %.3f ms | frame sim %d steps %.3f ms | fill RGBA %.3f ms | texture %.3f ms | measured total %.3f ms\n" % [world.get_last_sim_ms(), frame_steps, frame_sim_ms, world.get_last_fill_ms(), world.get_last_texture_ms(), frame_sim_ms + world.get_last_fill_ms() + world.get_last_texture_ms()]
 	text += "dt: %.3f | gravity: %.2f | viscosity: %.3f | active: %.2f | over: %.2f | under: %.2f | PCG: %d/%d residual %.2e\n" % [world.get_dt(), world.get_gravity(), world.get_viscosity(), _get_pressure_active_mass(), _get_density_correction_strength(), _get_underfill_correction_strength(), world.get_last_pcg_iterations(), world.get_pressure_iterations(), world.get_last_pcg_residual()]
 	text += "liquid volume: %.1f | avg volume/liquid cell: %.3f | liquid cells: %d\n" % [world.get_total_water_mass(), world.get_average_water_mass(), world.get_water_cell_count()]
 	if world.has_method("get_rigid_body_count"):
-		text += "rigid bodies: %d | MMB drag body, Shift+MMB rotate picked body\n" % [world.get_rigid_body_count()]
+		var awake_count: int = int(world.get_rigid_awake_count()) if world.has_method("get_rigid_awake_count") else -1
+		var sleeping_count: int = int(world.get_rigid_sleeping_count()) if world.has_method("get_rigid_sleeping_count") else -1
+		text += "rigid bodies: %d | awake: %d | sleeping: %d | MMB drag body, Shift+MMB rotate picked body\n" % [world.get_rigid_body_count(), awake_count, sleeping_count]
 	text += "paused: %s | Controls: Space pause, Esc basin, T rigid collision test, 1 water, 2 rock, 3 air, 4 sand, 5 smoke, 6 toxic, 7 oil, 8 fire, 9 steam, 0 toxic gas, F flammable gas, LMB paint/inject, RMB erase, MMB drag rigid, Shift+MMB rotate\n" % [str(world.is_paused())]
 	text += "+/- brush, [/] PCG iters | Brush: %s radius %.1f | LMB water vx %.1f" % [mat_name, brush_radius, inject_horizontal_speed]
 	info_label.text = text

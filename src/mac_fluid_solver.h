@@ -73,6 +73,8 @@ private:
 	std::vector<float> v;
 	std::vector<float> u_tmp;
 	std::vector<float> v_tmp;
+	std::vector<float> u_advected;
+	std::vector<float> v_advected;
 	std::vector<float> u_alpha;
 	std::vector<float> v_alpha;
 	std::vector<float> u_mass_flux;
@@ -100,6 +102,8 @@ private:
 	void apply_solid_boundaries(std::vector<float> &p_u, std::vector<float> &p_v);
 	float sample_u_clamped(const std::vector<float> &p_u, int32_t p_x, int32_t p_y) const;
 	float sample_v_clamped(const std::vector<float> &p_v, int32_t p_x, int32_t p_y) const;
+	float sample_u_bilinear(const std::vector<float> &p_u, float p_world_x, float p_world_y) const;
+	float sample_v_bilinear(const std::vector<float> &p_v, float p_world_x, float p_world_y) const;
 	float vertical_velocity_at_u_face(const std::vector<float> &p_v, int32_t p_x, int32_t p_y) const;
 	float horizontal_velocity_at_v_face(const std::vector<float> &p_u, int32_t p_x, int32_t p_y) const;
 	void predict_velocity_explicit();

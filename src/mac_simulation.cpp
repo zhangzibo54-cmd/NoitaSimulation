@@ -221,6 +221,8 @@ bool MacSimulation::start_rigid_drag(double p_x, double p_y) { return rigid_solv
 void MacSimulation::update_rigid_drag(double p_x, double p_y, bool p_rotate) { rigid_solver.update_drag(static_cast<float>(p_x), static_cast<float>(p_y), p_rotate); }
 void MacSimulation::end_rigid_drag() { rigid_solver.end_drag(); }
 int32_t MacSimulation::get_rigid_body_count() const { return rigid_solver.get_body_count(); }
+int32_t MacSimulation::get_rigid_awake_count() const { return rigid_solver.get_awake_body_count(); }
+int32_t MacSimulation::get_rigid_sleeping_count() const { return rigid_solver.get_sleeping_body_count(); }
 
 double MacSimulation::get_total_water_mass() const { return fluid_solver.get_total_water_mass(); }
 int64_t MacSimulation::get_water_cell_count() const { return fluid_solver.get_water_cell_count(); }

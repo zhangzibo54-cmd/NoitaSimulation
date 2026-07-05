@@ -226,10 +226,12 @@ void MacFluidSolver::ensure_buffers() {
 
 	u.resize(u_count, 0.0f);
 	u_tmp.resize(u_count, 0.0f);
+	u_advected.resize(u_count, 0.0f);
 	u_alpha.resize(u_count, 0.0f);
 	u_mass_flux.resize(u_count, 0.0f);
 	v.resize(v_count, 0.0f);
 	v_tmp.resize(v_count, 0.0f);
+	v_advected.resize(v_count, 0.0f);
 	v_alpha.resize(v_count, 0.0f);
 	v_mass_flux.resize(v_count, 0.0f);
 }
@@ -248,6 +250,8 @@ void MacFluidSolver::clear_fields() {
 	std::fill(v.begin(), v.end(), 0.0f);
 	std::fill(u_tmp.begin(), u_tmp.end(), 0.0f);
 	std::fill(v_tmp.begin(), v_tmp.end(), 0.0f);
+	std::fill(u_advected.begin(), u_advected.end(), 0.0f);
+	std::fill(v_advected.begin(), v_advected.end(), 0.0f);
 	std::fill(u_alpha.begin(), u_alpha.end(), 0.0f);
 	std::fill(v_alpha.begin(), v_alpha.end(), 0.0f);
 	std::fill(u_mass_flux.begin(), u_mass_flux.end(), 0.0f);
@@ -288,6 +292,44 @@ float MacFluidSolver::sample_v_clamped(const std::vector<float> &p_v, int32_t p_
 	return p_v[v_index(p_x, p_y)];
 }
 
+float MacFluidSolver::sample_u_bilinear(const std::vector<float> &p_u, float p_world_x, float p_world_y) const {
+	// u samples live on vertical faces at world positions (x, y + 0.5).
+	float fx = clampf(p_world_x, 0.0f, static_cast<float>(width));
+	float fy = clampf(p_world_y - 0.5f, 0.0f, static_cast<float>(height - 1));
+	const int32_t x0 = static_cast<int32_t>(std::floor(fx));
+	const int32_t y0 = static_cast<int32_t>(std::floor(fy));
+	const int32_t x1 = std::min(x0 + 1, width);
+	const int32_t y1 = std::min(y0 + 1, height - 1);
+	const float tx = fx - static_cast<float>(x0);
+	const float ty = fy - static_cast<float>(y0);
+	const float a = sample_u_clamped(p_u, x0, y0);
+	const float b = sample_u_clamped(p_u, x1, y0);
+	const float c = sample_u_clamped(p_u, x0, y1);
+	const float d = sample_u_clamped(p_u, x1, y1);
+	const float ab = a + (b - a) * tx;
+	const float cd = c + (d - c) * tx;
+	return ab + (cd - ab) * ty;
+}
+
+float MacFluidSolver::sample_v_bilinear(const std::vector<float> &p_v, float p_world_x, float p_world_y) const {
+	// v samples live on horizontal faces at world positions (x + 0.5, y).
+	float fx = clampf(p_world_x - 0.5f, 0.0f, static_cast<float>(width - 1));
+	float fy = clampf(p_world_y, 0.0f, static_cast<float>(height));
+	const int32_t x0 = static_cast<int32_t>(std::floor(fx));
+	const int32_t y0 = static_cast<int32_t>(std::floor(fy));
+	const int32_t x1 = std::min(x0 + 1, width - 1);
+	const int32_t y1 = std::min(y0 + 1, height);
+	const float tx = fx - static_cast<float>(x0);
+	const float ty = fy - static_cast<float>(y0);
+	const float a = sample_v_clamped(p_v, x0, y0);
+	const float b = sample_v_clamped(p_v, x1, y0);
+	const float c = sample_v_clamped(p_v, x0, y1);
+	const float d = sample_v_clamped(p_v, x1, y1);
+	const float ab = a + (b - a) * tx;
+	const float cd = c + (d - c) * tx;
+	return ab + (cd - ab) * ty;
+}
+
 float MacFluidSolver::vertical_velocity_at_u_face(const std::vector<float> &p_v, int32_t p_x, int32_t p_y) const {
 	// Average the four vertical faces touching the u-face sample point.
 	return 0.25f * (
@@ -307,8 +349,55 @@ float MacFluidSolver::horizontal_velocity_at_v_face(const std::vector<float> &p_
 }
 
 void MacFluidSolver::predict_velocity_explicit() {
-	u_tmp = u;
-	v_tmp = v;
+	// Semi-Lagrangian velocity advection.  This is the numerical version of the
+	// convective term (U · grad)U: trace each MAC face backward through the old
+	// velocity field and copy the velocity carried by the fluid parcel that
+	// arrives at this face.
+	u_advected = u;
+	v_advected = v;
+
+	for (int32_t y = 0; y < height; y++) {
+		for (int32_t x = 0; x <= width; x++) {
+			int32_t idx = u_index(x, y);
+			if (u_face_blocked(x, y)) {
+				u_advected[idx] = 0.0f;
+				continue;
+			}
+			if (!is_liquid_cell(x - 1, y) && !is_liquid_cell(x, y)) {
+				u_advected[idx] = 0.0f;
+				continue;
+			}
+			const float face_x = static_cast<float>(x);
+			const float face_y = static_cast<float>(y) + 0.5f;
+			const float vel_x = u[idx];
+			const float vel_y = vertical_velocity_at_u_face(v, x, y);
+			u_advected[idx] = sample_u_bilinear(u, face_x - dt * vel_x, face_y - dt * vel_y);
+		}
+	}
+
+	for (int32_t y = 1; y < height; y++) {
+		for (int32_t x = 0; x < width; x++) {
+			int32_t idx = v_index(x, y);
+			if (v_face_blocked(x, y)) {
+				v_advected[idx] = 0.0f;
+				continue;
+			}
+			if (!is_liquid_cell(x, y - 1) && !is_liquid_cell(x, y)) {
+				v_advected[idx] = 0.0f;
+				continue;
+			}
+			const float face_x = static_cast<float>(x) + 0.5f;
+			const float face_y = static_cast<float>(y);
+			const float vel_x = horizontal_velocity_at_v_face(u, x, y);
+			const float vel_y = v[idx];
+			v_advected[idx] = sample_v_bilinear(v, face_x - dt * vel_x, face_y - dt * vel_y);
+		}
+	}
+
+	apply_solid_boundaries(u_advected, v_advected);
+
+	u_tmp = u_advected;
+	v_tmp = v_advected;
 
 	for (int32_t y = 0; y < height; y++) {
 		for (int32_t x = 1; x < width; x++) {
@@ -317,11 +406,9 @@ void MacFluidSolver::predict_velocity_explicit() {
 				u_tmp[idx] = 0.0f;
 				continue;
 			}
-			float u0 = u[idx];
-			float lap = sample_u_clamped(u, x + 1, y) + sample_u_clamped(u, x - 1, y) +
-					sample_u_clamped(u, x, y + 1) + sample_u_clamped(u, x, y - 1) - 4.0f * u0;
-			// Temporarily remove the explicit convective term -(U �?grad)u.
-			// This isolates whether self-advection is injecting residual motion.
+			float u0 = u_advected[idx];
+			float lap = sample_u_clamped(u_advected, x + 1, y) + sample_u_clamped(u_advected, x - 1, y) +
+					sample_u_clamped(u_advected, x, y + 1) + sample_u_clamped(u_advected, x, y - 1) - 4.0f * u0;
 			u_tmp[idx] = u0 + dt * (viscosity * lap);
 		}
 	}
@@ -333,11 +420,9 @@ void MacFluidSolver::predict_velocity_explicit() {
 				v_tmp[idx] = 0.0f;
 				continue;
 			}
-			float v0 = v[idx];
-			float lap = sample_v_clamped(v, x + 1, y) + sample_v_clamped(v, x - 1, y) +
-					sample_v_clamped(v, x, y + 1) + sample_v_clamped(v, x, y - 1) - 4.0f * v0;
-			// Temporarily remove the explicit convective term -(U �?grad)v.
-			// Gravity and viscosity remain active.
+			float v0 = v_advected[idx];
+			float lap = sample_v_clamped(v_advected, x + 1, y) + sample_v_clamped(v_advected, x - 1, y) +
+					sample_v_clamped(v_advected, x, y + 1) + sample_v_clamped(v_advected, x, y - 1) - 4.0f * v0;
 			v_tmp[idx] = v0 + dt * (viscosity * lap + gravity);
 		}
 	}

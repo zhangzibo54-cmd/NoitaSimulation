@@ -77,6 +77,8 @@ public:
 	void update_rigid_drag(double p_x, double p_y, bool p_rotate);
 	void end_rigid_drag();
 	int32_t get_rigid_body_count() const;
+	int32_t get_rigid_awake_count() const;
+	int32_t get_rigid_sleeping_count() const;
 
 	double get_total_water_mass() const;
 	int64_t get_water_cell_count() const;

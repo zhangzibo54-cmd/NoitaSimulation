@@ -3,6 +3,7 @@
 #include "world_grid.h"
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 class RigidBodySolver {
@@ -39,7 +40,12 @@ private:
 		int32_t wake_min_y = 0;
 		int32_t wake_max_x = 0;
 		int32_t wake_max_y = 0;
+		float local_min_x = 0.0f;
+		float local_min_y = 0.0f;
+		float local_max_x = 0.0f;
+		float local_max_y = 0.0f;
 		float still_time = 0.0f;
+		bool had_contact = false;
 		bool active = true;
 		bool sleeping = false;
 	};
@@ -83,11 +89,18 @@ private:
 		float penetration = 0.0f;
 	};
 
+	struct CoveredCell {
+		int32_t x = 0;
+		int32_t y = 0;
+		int32_t source_index = -1;
+		int64_t key = 0;
+	};
+
 	float gravity = 0.035f;
 	float linear_damping = 0.995f;
 	float angular_damping = 0.990f;
-	float settle_speed = 0.25f;
-	float settle_angular_speed = 0.045f;
+	float settle_speed = 0.45f;
+	float settle_angular_speed = 0.080f;
 	float restitution = 0.22f;
 	float friction = 0.55f;
 	float positional_correction_fraction = 0.70f;
@@ -115,6 +128,8 @@ private:
 	float drag_start_body_angle = 0.0f;
 
 	std::vector<RigidBody> bodies;
+	mutable std::unordered_map<int32_t, int32_t> body_index_by_id;
+	mutable bool body_index_dirty = true;
 	std::vector<StaticCollisionChunk> static_chunks;
 	int32_t static_chunks_x = 0;
 	int32_t static_chunks_y = 0;
@@ -134,6 +149,8 @@ private:
 	int32_t current_stamp = 1;
 
 	void ensure_buffers(const WorldGrid &p_grid);
+	void mark_body_index_dirty();
+	void rebuild_body_index_map() const;
 	bool is_dynamic_solid_material(uint8_t p_material) const;
 	bool is_anchor_cell(const WorldGrid &p_grid, int32_t p_x, int32_t p_y) const;
 	void mark_visited(int32_t p_index);
@@ -151,18 +168,25 @@ private:
 	void recompute_mass_properties(RigidBody &r_body, bool p_recenter);
 	void cell_world_position(const RigidBody &p_body, const BodyCell &p_cell, float &r_x, float &r_y) const;
 	bool raster_cell(const RigidBody &p_body, const BodyCell &p_cell, int32_t &r_x, int32_t &r_y) const;
+	void collect_body_covered_cells(const RigidBody &p_body, const WorldGrid *p_grid, const std::vector<int32_t> *p_indices, float p_half_extent, std::vector<CoveredCell> &r_cells) const;
 	bool static_solid_or_boundary(const WorldGrid &p_grid, int32_t p_x, int32_t p_y) const;
 	void estimate_contact_normal(const WorldGrid &p_grid, int32_t p_x, int32_t p_y, float p_wx, float p_wy, float p_fallback_vx, float p_fallback_vy, float &r_nx, float &r_ny) const;
 	void collect_contacts(const WorldGrid &p_grid, const RigidBody &p_body, std::vector<Contact> &r_contacts) const;
-	void collect_static_chunk_contacts(const RigidBody &p_body, const StaticCollisionChunk &p_chunk, std::vector<Contact> &r_contacts) const;
+	void build_body_cell_hash(const RigidBody &p_body, std::vector<int64_t> &r_keys) const;
+	bool boundary_overlaps_body_cells(const RigidBody &p_boundary_body, const RigidBody &p_solid_body, const std::vector<int64_t> *p_solid_keys = nullptr, int32_t *r_overlap_count = nullptr) const;
+	bool boundary_overlaps_static(const WorldGrid &p_grid, const RigidBody &p_body, int32_t *r_overlap_count = nullptr) const;
+	bool has_overlap_blocking_sleep(const WorldGrid &p_grid, const RigidBody &p_body);
+	void add_body_overlap_contacts(const RigidBody &p_boundary_body, const RigidBody &p_solid_body, bool p_normal_b_to_a, const std::vector<int64_t> &p_solid_keys, std::vector<Contact> &r_contacts) const;
+	void add_static_overlap_contacts(const WorldGrid &p_grid, const RigidBody &p_body, const StaticCollisionChunk &p_chunk, std::vector<Contact> &r_contacts) const;
+	void collect_static_chunk_contacts(const WorldGrid &p_grid, const RigidBody &p_body, const StaticCollisionChunk &p_chunk, std::vector<Contact> &r_contacts) const;
 	void resolve_contacts(RigidBody &r_body, const std::vector<Contact> &p_contacts);
 	void resolve_body_pair_contacts(RigidBody &r_a, RigidBody &r_b);
-	void resolve_static_pair_contacts(RigidBody &r_body, const StaticCollisionChunk &p_chunk);
-	void resolve_dynamic_body_contacts();
+	void resolve_static_pair_contacts(const WorldGrid &p_grid, RigidBody &r_body, const StaticCollisionChunk &p_chunk);
+	void resolve_dynamic_body_contacts(const WorldGrid &p_grid);
 	RigidBody *find_body_by_id(int32_t p_id);
 	const RigidBody *find_body_by_id(int32_t p_id) const;
 	bool aabb_overlap_expanded(const RigidBody &p_a, const RigidBody &p_b, int32_t p_padding) const;
-	void update_sleep_state(RigidBody &r_body, bool p_had_contact);
+	void update_sleep_state(const WorldGrid &p_grid, RigidBody &r_body, bool p_had_contact);
 	void bake_body_to_grid(WorldGrid &p_grid, RigidBody &r_body);
 	bool can_displace_into(const WorldGrid &p_grid, int32_t p_x, int32_t p_y) const;
 	bool displace_cell_from_rigid(WorldGrid &p_grid, int32_t p_x, int32_t p_y, float p_vx, float p_vy);
@@ -186,4 +210,6 @@ public:
 	void update_drag(float p_x, float p_y, bool p_rotate);
 	void end_drag();
 	int32_t get_body_count() const;
+	int32_t get_awake_body_count() const;
+	int32_t get_sleeping_body_count() const;
 };

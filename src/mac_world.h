@@ -38,12 +38,18 @@ private:
 	bool paused = false;
 	float simulation_speed = 1.0f;
 	float step_accumulator = 0.0f;
+	double last_sim_ms = 0.0;
+	double last_fill_ms = 0.0;
+	double last_texture_ms = 0.0;
+	double last_frame_sim_ms = 0.0;
+	int32_t last_frame_sim_steps = 0;
 
 	std::vector<uint8_t> rgba_pixels;
 	PackedByteArray pixels;
 	Ref<Image> image;
 	Ref<ImageTexture> texture;
 
+	void run_sim_step();
 	void update_texture();
 
 protected:
@@ -94,11 +100,18 @@ public:
 	void update_rigid_drag(double p_x, double p_y, bool p_rotate);
 	void end_rigid_drag();
 	int32_t get_rigid_body_count() const;
+	int32_t get_rigid_awake_count() const;
+	int32_t get_rigid_sleeping_count() const;
 
 	double get_total_water_mass() const;
 	int64_t get_water_cell_count() const;
 	double get_average_water_mass() const;
 	double get_last_step_ms() const;
+	double get_last_sim_ms() const;
+	double get_last_fill_ms() const;
+	double get_last_texture_ms() const;
+	double get_last_frame_sim_ms() const;
+	int32_t get_last_frame_sim_steps() const;
 	int64_t get_step_count() const;
 	int32_t get_last_pcg_iterations() const;
 	double get_last_pcg_residual() const;

@@ -4,11 +4,16 @@
 #include <godot_cpp/variant/rect2.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace {
 float clampf(float v, float lo, float hi) {
 	return std::max(lo, std::min(v, hi));
+}
+
+double elapsed_ms(std::chrono::steady_clock::time_point p_start, std::chrono::steady_clock::time_point p_end) {
+	return std::chrono::duration<double, std::milli>(p_end - p_start).count();
 }
 } // namespace
 
@@ -51,10 +56,17 @@ void MacWorld::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_rigid_drag", "x", "y", "rotate"), &MacWorld::update_rigid_drag);
 	ClassDB::bind_method(D_METHOD("end_rigid_drag"), &MacWorld::end_rigid_drag);
 	ClassDB::bind_method(D_METHOD("get_rigid_body_count"), &MacWorld::get_rigid_body_count);
+	ClassDB::bind_method(D_METHOD("get_rigid_awake_count"), &MacWorld::get_rigid_awake_count);
+	ClassDB::bind_method(D_METHOD("get_rigid_sleeping_count"), &MacWorld::get_rigid_sleeping_count);
 	ClassDB::bind_method(D_METHOD("get_total_water_mass"), &MacWorld::get_total_water_mass);
 	ClassDB::bind_method(D_METHOD("get_water_cell_count"), &MacWorld::get_water_cell_count);
 	ClassDB::bind_method(D_METHOD("get_average_water_mass"), &MacWorld::get_average_water_mass);
 	ClassDB::bind_method(D_METHOD("get_last_step_ms"), &MacWorld::get_last_step_ms);
+	ClassDB::bind_method(D_METHOD("get_last_sim_ms"), &MacWorld::get_last_sim_ms);
+	ClassDB::bind_method(D_METHOD("get_last_fill_ms"), &MacWorld::get_last_fill_ms);
+	ClassDB::bind_method(D_METHOD("get_last_texture_ms"), &MacWorld::get_last_texture_ms);
+	ClassDB::bind_method(D_METHOD("get_last_frame_sim_ms"), &MacWorld::get_last_frame_sim_ms);
+	ClassDB::bind_method(D_METHOD("get_last_frame_sim_steps"), &MacWorld::get_last_frame_sim_steps);
 	ClassDB::bind_method(D_METHOD("get_step_count"), &MacWorld::get_step_count);
 	ClassDB::bind_method(D_METHOD("get_last_pcg_iterations"), &MacWorld::get_last_pcg_iterations);
 	ClassDB::bind_method(D_METHOD("get_last_pcg_residual"), &MacWorld::get_last_pcg_residual);
@@ -82,13 +94,21 @@ void MacWorld::_process(double p_delta) {
 	}
 	step_accumulator += static_cast<float>(p_delta * 60.0 * simulation_speed);
 	int32_t steps_this_frame = 0;
+	double sim_ms_this_frame = 0.0;
 	while (step_accumulator >= 1.0f && steps_this_frame < 6) {
-		step();
+		run_sim_step();
+		sim_ms_this_frame += last_sim_ms;
 		step_accumulator -= 1.0f;
 		steps_this_frame++;
 	}
 	if (steps_this_frame == 6) {
 		step_accumulator = 0.0f;
+	}
+	last_frame_sim_steps = steps_this_frame;
+	last_frame_sim_ms = sim_ms_this_frame;
+	if (steps_this_frame > 0) {
+		update_texture();
+		queue_redraw();
 	}
 }
 
@@ -98,11 +118,24 @@ void MacWorld::_draw() {
 	}
 }
 
+void MacWorld::run_sim_step() {
+	const auto sim_start = std::chrono::steady_clock::now();
+	sim.step();
+	const auto sim_end = std::chrono::steady_clock::now();
+	last_sim_ms = elapsed_ms(sim_start, sim_end);
+}
+
 void MacWorld::update_texture() {
+	const auto fill_start = std::chrono::steady_clock::now();
 	sim.fill_rgba_pixels(rgba_pixels);
+	const auto fill_end = std::chrono::steady_clock::now();
+	last_fill_ms = elapsed_ms(fill_start, fill_end);
 	if (rgba_pixels.empty()) {
+		last_texture_ms = 0.0;
 		return;
 	}
+
+	const auto texture_start = std::chrono::steady_clock::now();
 	pixels.resize(static_cast<int64_t>(rgba_pixels.size()));
 	std::memcpy(pixels.ptrw(), rgba_pixels.data(), rgba_pixels.size());
 	const int32_t width = sim.get_width();
@@ -117,6 +150,8 @@ void MacWorld::update_texture() {
 	} else {
 		texture->update(image);
 	}
+	const auto texture_end = std::chrono::steady_clock::now();
+	last_texture_ms = elapsed_ms(texture_start, texture_end);
 }
 
 void MacWorld::set_world_size(int32_t p_width, int32_t p_height) {
@@ -150,7 +185,9 @@ void MacWorld::set_underfill_correction_strength(double p_strength) { sim.set_un
 double MacWorld::get_underfill_correction_strength() const { return sim.get_underfill_correction_strength(); }
 
 void MacWorld::step() {
-	sim.step();
+	run_sim_step();
+	last_frame_sim_steps = 1;
+	last_frame_sim_ms = last_sim_ms;
 	update_texture();
 	queue_redraw();
 }
@@ -210,11 +247,18 @@ void MacWorld::end_rigid_drag() {
 }
 
 int32_t MacWorld::get_rigid_body_count() const { return sim.get_rigid_body_count(); }
+int32_t MacWorld::get_rigid_awake_count() const { return sim.get_rigid_awake_count(); }
+int32_t MacWorld::get_rigid_sleeping_count() const { return sim.get_rigid_sleeping_count(); }
 
 double MacWorld::get_total_water_mass() const { return sim.get_total_water_mass(); }
 int64_t MacWorld::get_water_cell_count() const { return sim.get_water_cell_count(); }
 double MacWorld::get_average_water_mass() const { return sim.get_average_water_mass(); }
 double MacWorld::get_last_step_ms() const { return sim.get_last_step_ms(); }
+double MacWorld::get_last_sim_ms() const { return last_sim_ms; }
+double MacWorld::get_last_fill_ms() const { return last_fill_ms; }
+double MacWorld::get_last_texture_ms() const { return last_texture_ms; }
+double MacWorld::get_last_frame_sim_ms() const { return last_frame_sim_ms; }
+int32_t MacWorld::get_last_frame_sim_steps() const { return last_frame_sim_steps; }
 int64_t MacWorld::get_step_count() const { return sim.get_step_count(); }
 int32_t MacWorld::get_last_pcg_iterations() const { return sim.get_last_pcg_iterations(); }
 double MacWorld::get_last_pcg_residual() const { return sim.get_last_pcg_residual(); }

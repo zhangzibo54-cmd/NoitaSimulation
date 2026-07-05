@@ -2600,3 +2600,444 @@ active bucket:
 ```
 
 也就是说 static 和 sleeping 的空间 group 可以复用，active 由于一直移动，只低频临时构建。
+
+## Rigid overlap sleep blocking and overlap response
+
+### Code locations
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\rigid_body_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\rigid_body_solver.cpp
+```
+
+Main functions:
+
+```cpp
+build_body_cell_hash()
+boundary_overlaps_body_cells()
+boundary_overlaps_static()
+has_overlap_blocking_sleep()
+add_body_overlap_contacts()
+add_static_overlap_contacts()
+update_sleep_state()
+resolve_body_pair_contacts()
+resolve_static_pair_contacts()
+```
+
+### Lifecycle position
+
+In one simulation frame:
+
+```text
+1. move active rigid bodies by velocity / gravity
+2. every ~0.1 s: rebuild broad phase pairs and wake unsupported sleepers
+3. every frame: resolve cached active body/body and body/static pairs
+4. after collision: update sleep state
+5. repopulate rigid overlay into WorldGrid
+```
+
+The new overlap logic appears in steps 3 and 4:
+
+- step 3: collision response adds robust overlap contacts;
+- step 4: sleep timer is blocked if overlap still exists.
+
+### Why boundary-vs-full-cells instead of all-vs-all
+
+The expensive exact test would compare every occupied cell of body A with every occupied cell of body B. That is unnecessary. For penetration detection, it is enough to ask:
+
+```text
+Does any boundary cell of A rasterize into any occupied cell of B?
+```
+
+So the implemented test is:
+
+```text
+B hash = sorted unique world-cell keys of all B cells
+A query = all boundary cells of A
+if A_boundary_cell_key exists in B hash -> overlap
+```
+
+This is roughly:
+
+```text
+O(B_cells log B_cells + A_boundary log B_cells)
+```
+
+rather than:
+
+```text
+O(A_cells * B_cells)
+```
+
+For sleeping validation this uses the full boundary, not the random/sampled collision boundary, so a body cannot freeze while a sampled narrow phase missed an interpenetration.
+
+### Sleep overlap blocking
+
+`update_sleep_state(grid, body, had_contact)` now only accumulates `still_time` when all of these are true:
+
+```text
+near contact exists
+linear speed < settle_speed
+angular speed < settle_angular_speed
+no overlap with static terrain
+no overlap with relevant rigid bodies
+```
+
+Relevant rigid candidates are:
+
+```text
+1. counterpart bodies in active_body_pairs
+2. nearby sleeping bodies from sleeping_bucket
+```
+
+Static overlap does not hash the whole static world. It directly checks the candidate body's full boundary against `WorldGrid`:
+
+```text
+for boundary cell of body:
+  if rasterized cell is static solid or world boundary:
+    overlap = true
+```
+
+If overlap exists, `still_time` is reset to 0, so the body stays active and collision resolution continues next frame.
+
+### Collision overlap response
+
+The normal narrow phase still uses the fast sampled-boundary contact test. After that, body/body collision additionally performs:
+
+```text
+A full-boundary vs B full-cell hash
+B full-boundary vs A full-cell hash
+```
+
+For detected overlaps, it adds extra contacts. The overlap count is used as a cheap area estimate:
+
+```cpp
+penetration = clamp(0.65 + 0.045 * sqrt(overlap_count), 0.65, 1.65)
+```
+
+This mainly strengthens positional correction, instead of simply multiplying velocity impulse. That avoids explosive rebounds while still pushing embedded chunks apart more decisively.
+
+Static collision also gets a full-boundary overlap supplement, but only inside the active static chunk's bounds. So it avoids repeating the same terrain contact for every static chunk.
+
+### Important behavior change
+
+A rigid body can now look visually still but remain active if it is still overlapping another rigid body or static terrain. This is intentional: sleep is only allowed after separation is confirmed by full-boundary overlap checks.
+
+### Rigid static depenetration and tilted rendering note
+
+After testing a tilted chunk embedded in the floor, static overlap response was strengthened in:
+
+```cpp
+RigidBodySolver::add_static_overlap_contacts()
+```
+
+Important change:
+
+```text
+if a rigid boundary pixel is inside static solid:
+  search up to 10 cells for nearest open/non-solid cell
+  use direction from solid to nearest open cell as escape normal
+  add stronger overlap penetration, capped at 4 cells
+```
+
+This is still not a real force field. It is positional depenetration: deep static overlap is converted into stronger contact penetration so the solver moves the chunk out over collision iterations.
+
+Rigid tilted rendering is handled in C++, not Godot. The pipeline is:
+
+```text
+RigidBodySolver::draw_overlay_rgba()
+  -> MacSimulation::fill_rgba_pixels()
+  -> MacWorld::update_texture()
+  -> Godot ImageTexture update and draw_texture_rect()
+```
+
+Godot only displays the final RGBA texture. It does not rotate sprites or draw separate rigid-body nodes.
+
+The old renderer painted each rigid cell only at `floor(rotated_center)`, which caused holes/flicker on tilted chunks. It now rasterizes each body cell as a rotated unit square into the RGBA buffer. Rock shading also uses local cell coordinates instead of world coordinates, so the texture pattern no longer crawls over the body while it moves.
+
+### Frame timing probes
+
+Added in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+```
+
+The debug UI now reports:
+
+```text
+last_sim_ms
+last_fill_ms
+last_texture_ms
+```
+
+Meaning:
+
+```text
+last_sim_ms:
+  Time spent in sim.step(). This is the actual simulation side: rigid bodies,
+  powder, liquid pressure/advection, gas, fire, and reactions.
+
+last_fill_ms:
+  Time spent converting simulation state into the CPU RGBA pixel buffer via
+  MacSimulation::fill_rgba_pixels(), including fluid_solver.fill_rgba_pixels()
+  and rigid_solver.draw_overlay_rgba(). If conservative rigid rasterization is
+  expensive, it shows up here.
+
+last_texture_ms:
+  Time spent resizing/copying the PackedByteArray, updating the Godot Image, and
+  calling ImageTexture::update/create_from_image(). If the bottleneck is CPU->GPU
+  texture upload or Godot image update, it shows up here.
+```
+
+Important limitation: this is the last executed simulation tick. If `simulation_speed` causes multiple `step()` calls in one rendered frame, each step currently also calls `update_texture()`, so the real frame cost can be roughly the sum of several sim/fill/texture updates plus Godot UI rendering and vsync wait.
+
+### Render once per frame after multiple simulation catch-up steps
+
+`MacWorld::_process()` previously called public `step()` inside the catch-up loop. Public `step()` runs:
+
+```text
+sim.step()
+update_texture()
+queue_redraw()
+```
+
+So when FPS dropped and the accumulator requested multiple simulation steps, one rendered frame could upload the texture several times.
+
+Now `_process()` calls internal:
+
+```cpp
+run_sim_step()
+```
+
+inside the catch-up loop, and only after all simulation catch-up steps are complete does it call:
+
+```cpp
+update_texture();
+queue_redraw();
+```
+
+The UI also reports:
+
+```text
+frame sim N steps X ms
+```
+
+This exposes spiral-of-death cases where a slow frame causes several simulation steps to be executed in the next rendered frame. If `N` stays above 1 for many frames, the simulation is behind real time.
+
+### Rigid solver hotspot optimization pass: id map, O(1) AABB, contact flag
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\rigid_body_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\rigid_body_solver.cpp
+```
+
+Changes:
+
+1. `find_body_by_id()` no longer linearly scans `bodies`.
+
+```text
+Before:
+  each lookup = O(number_of_bodies)
+  hot paths: collision pair resolving, broad phase, sleeping support, overlap checks
+
+Now:
+  maintain lazy id -> body array index cache
+  lookup is average O(1)
+  cache is marked dirty when bodies are pushed or erased
+```
+
+2. `update_body_aabb()` no longer calls conservative covered-cell rasterization.
+
+```text
+Before:
+  collect_body_covered_cells()
+  transform many cells
+  push vector
+  sort by cell key
+  unique
+  scan min/max
+
+Now:
+  recompute_mass_properties() stores local body bounds once after topology/recenter
+  update_body_aabb() rotates only four local AABB corners
+  then adds a one-cell conservative pad
+```
+
+This removes an O(N log N) allocation-heavy pass from the per-body/per-collision-iteration hot path.
+
+3. Sleep contact detection no longer scans all active pair lists per body.
+
+```text
+Before:
+  for each body:
+    scan active_static_pairs
+    scan active_body_pairs
+
+Now:
+  each body owns had_contact
+  resolve_static_pair_contacts() / resolve_body_pair_contacts() set had_contact=true when actual contacts are found
+  sleep update reads body.had_contact directly
+```
+
+Expected impact:
+
+```text
+large rigid piles:
+  less id lookup overhead
+  less AABB recomputation overhead
+  less per-body pair-list scanning
+```
+
+Remaining known heavyweight area:
+
+```text
+resolve_body_pair_contacts() still rebuilds covered-cell hashes per pair and per collision iteration.
+The next optimization should cache covered cells / full cell keys once per body per simulation step and reuse them across pair solving, static overlap, populate overlay, and rendering.
+```
+
+### Rigid sleep logic fix: contact no longer resets sleep timer every frame
+
+Problem found:
+
+```cpp
+resolve_body_pair_contacts()
+```
+
+previously did this whenever a body/body contact existed:
+
+```cpp
+r_a.sleeping = false;
+r_b.sleeping = false;
+r_a.still_time = 0.0f;
+r_b.still_time = 0.0f;
+```
+
+That made piles almost impossible to sleep: stacked bodies are always touching, so their sleep timer was cleared every frame.
+
+Current behavior:
+
+```text
+body/body contact sets had_contact = true
+active-active low-speed contact no longer clears still_time
+sleeping bodies are only woken by a contacting body if that body is moving faster than the wake threshold
+broad phase no longer wakes sleeping bodies only because their wake AABB overlaps an active body
+```
+
+Also relaxed sleep overlap blocking:
+
+```text
+small conservative-raster overlaps are tolerated for sleep
+only overlap_count > 12 blocks sleep
+```
+
+This avoids the conservative rigid raster turning tiny resting contacts into permanent sleep blockers.
+
+Debug UI now reports:
+
+```text
+rigid bodies: total | awake: N | sleeping: M
+```
+
+Code locations:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\rigid_body_solver.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\rigid_body_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_simulation.cpp/.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.cpp/.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+```
+
+### Rigid sleep support fix
+
+Problem:
+
+Sleeping still stayed at 0 because `update_sleep_state()` only accumulated `still_time` when `had_contact == true`.
+
+A rigid body resting on the floor can be pushed to a non-penetrating position, so the next frame may have no collision contact even though the body is clearly supported. That reset `still_time` every frame.
+
+Fix:
+
+```text
+can_accumulate_sleep = had_contact OR body_has_support(grid, body)
+```
+
+Also changed support detection:
+
+```text
+body_has_support() now uses full boundary_indices, not collision_sample_indices
+below rigid overlay from any other active/sleeping body counts as support
+```
+
+And relaxed sleep thresholds:
+
+```text
+settle_speed: 0.25 -> 0.45
+settle_angular_speed: 0.045 -> 0.080
+```
+
+This lets resting bodies and stacked bodies enter sleep even when they are not producing solver contacts every frame.
+
+### Semi-Lagrangian velocity advection for MAC fluid
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.cpp
+```
+
+New helpers:
+
+```cpp
+sample_u_bilinear()
+sample_v_bilinear()
+```
+
+`predict_velocity_explicit()` now starts with a semi-Lagrangian advection pass for the MAC velocity field:
+
+```text
+for every u face at world position (x, y + 0.5):
+  face_velocity = (u_old(x,y), average surrounding v_old)
+  source = face_position - dt * face_velocity
+  u_advected(face) = bilinear_sample_u_old(source)
+
+for every v face at world position (x + 0.5, y):
+  face_velocity = (average surrounding u_old, v_old(x,y))
+  source = face_position - dt * face_velocity
+  v_advected(face) = bilinear_sample_v_old(source)
+```
+
+Then viscosity and gravity are applied on top of the advected velocity:
+
+```text
+u_tmp = u_advected + dt * viscosity * laplacian(u_advected)
+v_tmp = v_advected + dt * (viscosity * laplacian(v_advected) + gravity)
+```
+
+Then the existing pressure projection runs:
+
+```text
+build_pressure_system()
+solve_pressure_pcg()
+apply_pressure_projection()
+advect_mass_finite_volume()
+```
+
+Meaning:
+
+```text
+volume is still advected by the projected velocity field,
+but now the velocity field itself is also transported by the flow.
+```
+
+This should preserve horizontal momentum much better for water guns, parabolic jets, and falling streams. It is the stable numerical form of the convective term `(u · ∇)u`.
+
+Note: semi-Lagrangian advection is intentionally dissipative. It is stable, but it can blur/decay velocity over time. If stronger momentum preservation is needed later, the next step is BFECC/MacCormack velocity advection or finite-volume momentum advection.
