@@ -1,4 +1,4 @@
-﻿#include "mac_world.h"
+#include "mac_world.h"
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/rect2.hpp>
@@ -42,8 +42,15 @@ void MacWorld::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("step"), &MacWorld::step);
 	ClassDB::bind_method(D_METHOD("clear"), &MacWorld::clear);
 	ClassDB::bind_method(D_METHOD("generate_basin"), &MacWorld::generate_basin);
+	ClassDB::bind_method(D_METHOD("generate_rigid_collision_test"), &MacWorld::generate_rigid_collision_test);
+	ClassDB::bind_method(D_METHOD("begin_rigid_paint_stroke"), &MacWorld::begin_rigid_paint_stroke);
+	ClassDB::bind_method(D_METHOD("end_rigid_paint_stroke"), &MacWorld::end_rigid_paint_stroke);
 	ClassDB::bind_method(D_METHOD("paint_circle", "x", "y", "radius", "material"), &MacWorld::paint_circle);
 	ClassDB::bind_method(D_METHOD("inject_water", "x", "y", "radius", "mass_per_cell", "velocity_x", "velocity_y"), &MacWorld::inject_water);
+	ClassDB::bind_method(D_METHOD("start_rigid_drag", "x", "y"), &MacWorld::start_rigid_drag);
+	ClassDB::bind_method(D_METHOD("update_rigid_drag", "x", "y", "rotate"), &MacWorld::update_rigid_drag);
+	ClassDB::bind_method(D_METHOD("end_rigid_drag"), &MacWorld::end_rigid_drag);
+	ClassDB::bind_method(D_METHOD("get_rigid_body_count"), &MacWorld::get_rigid_body_count);
 	ClassDB::bind_method(D_METHOD("get_total_water_mass"), &MacWorld::get_total_water_mass);
 	ClassDB::bind_method(D_METHOD("get_water_cell_count"), &MacWorld::get_water_cell_count);
 	ClassDB::bind_method(D_METHOD("get_average_water_mass"), &MacWorld::get_average_water_mass);
@@ -154,6 +161,22 @@ void MacWorld::clear() {
 	queue_redraw();
 }
 
+void MacWorld::generate_rigid_collision_test() {
+	sim.generate_rigid_collision_test();
+	update_texture();
+	queue_redraw();
+}
+
+void MacWorld::begin_rigid_paint_stroke() {
+	sim.begin_rigid_paint_stroke();
+}
+
+void MacWorld::end_rigid_paint_stroke() {
+	sim.end_rigid_paint_stroke();
+	update_texture();
+	queue_redraw();
+}
+
 void MacWorld::generate_basin() {
 	sim.generate_basin();
 	update_texture();
@@ -171,6 +194,22 @@ void MacWorld::inject_water(double p_x, double p_y, double p_radius, double p_ma
 	update_texture();
 	queue_redraw();
 }
+
+bool MacWorld::start_rigid_drag(double p_x, double p_y) {
+	return sim.start_rigid_drag(p_x, p_y);
+}
+
+void MacWorld::update_rigid_drag(double p_x, double p_y, bool p_rotate) {
+	sim.update_rigid_drag(p_x, p_y, p_rotate);
+	update_texture();
+	queue_redraw();
+}
+
+void MacWorld::end_rigid_drag() {
+	sim.end_rigid_drag();
+}
+
+int32_t MacWorld::get_rigid_body_count() const { return sim.get_rigid_body_count(); }
 
 double MacWorld::get_total_water_mass() const { return sim.get_total_water_mass(); }
 int64_t MacWorld::get_water_cell_count() const { return sim.get_water_cell_count(); }

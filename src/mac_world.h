@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "mac_simulation.h"
 
@@ -20,6 +20,15 @@ public:
 		MATERIAL_AIR = MacSimulation::MATERIAL_AIR,
 		MATERIAL_ROCK = MacSimulation::MATERIAL_ROCK,
 		MATERIAL_WATER = MacSimulation::MATERIAL_WATER,
+		MATERIAL_SAND = MacSimulation::MATERIAL_SAND,
+		MATERIAL_SMOKE = MacSimulation::MATERIAL_SMOKE,
+		MATERIAL_TOXIC = MacSimulation::MATERIAL_TOXIC,
+		MATERIAL_OIL = MacSimulation::MATERIAL_OIL,
+		MATERIAL_FIRE = MacSimulation::MATERIAL_FIRE,
+		MATERIAL_STEAM = MacSimulation::MATERIAL_STEAM,
+		MATERIAL_TOXIC_GAS = MacSimulation::MATERIAL_TOXIC_GAS,
+		MATERIAL_FLAMMABLE_GAS = MacSimulation::MATERIAL_FLAMMABLE_GAS,
+		MATERIAL_GLASS = MacSimulation::MATERIAL_GLASS,
 	};
 
 private:
@@ -76,8 +85,15 @@ public:
 	void step();
 	void clear();
 	void generate_basin();
+	void generate_rigid_collision_test();
+	void begin_rigid_paint_stroke();
+	void end_rigid_paint_stroke();
 	void paint_circle(double p_x, double p_y, double p_radius, int32_t p_material);
 	void inject_water(double p_x, double p_y, double p_radius, double p_mass_per_cell, double p_velocity_x, double p_velocity_y);
+	bool start_rigid_drag(double p_x, double p_y);
+	void update_rigid_drag(double p_x, double p_y, bool p_rotate);
+	void end_rigid_drag();
+	int32_t get_rigid_body_count() const;
 
 	double get_total_water_mass() const;
 	int64_t get_water_cell_count() const;

@@ -3,9 +3,12 @@ extends Node2D
 var world
 var info_label: Label
 var param_labels := {}
-var brush_material := 2 # 0 air, 1 rock, 2 water
+var brush_material := 2 # 0 air, 1 rock, 2 water, 3 sand, 4 smoke, 5 toxic, 6 oil, 7 fire, 8 steam, 9 toxic gas, 10 flammable gas
 var brush_radius := 6.0
 var inject_horizontal_speed := 0.0
+var rigid_dragging := false
+var rigid_test_key_was_down := false
+var rigid_paint_stroke := false
 
 func _ready() -> void:
 	world = ClassDB.instantiate("MacWorld")
@@ -21,13 +24,16 @@ func _ready() -> void:
 	world.set_viscosity(0.04)
 	world.set_pressure_iterations(20)
 	if world.has_method("set_pressure_active_mass"):
-		world.set_pressure_active_mass(0.30)
+		world.set_pressure_active_mass(0.50)
 	if world.has_method("set_density_correction_strength"):
 		world.set_density_correction_strength(0.20)
 	if world.has_method("set_underfill_correction_strength"):
-		world.set_underfill_correction_strength(0.40)
+		world.set_underfill_correction_strength(0.30)
 	world.set_simulation_speed(1.0)
-	world.generate_basin()
+	if world.has_method("generate_rigid_collision_test"):
+		world.generate_rigid_collision_test()
+	else:
+		world.generate_basin()
 	add_child(world)
 
 	var layer := CanvasLayer.new()
@@ -146,11 +152,11 @@ func _update_param_labels() -> void:
 	if param_labels.has("pressure_iterations"):
 		param_labels["pressure_iterations"].text = "PCG max iterations: %d" % [world.get_pressure_iterations()]
 	if param_labels.has("pressure_active_mass"):
-		param_labels["pressure_active_mass"].text = "pressure active mass threshold: %.2f" % [_get_pressure_active_mass()]
+		param_labels["pressure_active_mass"].text = "pressure active volume threshold: %.2f" % [_get_pressure_active_mass()]
 	if param_labels.has("density_correction"):
-		param_labels["density_correction"].text = "density correction strength: %.2f  target div = k * max(mass-1,0)/dt" % [_get_density_correction_strength()]
+		param_labels["density_correction"].text = "density correction strength: %.2f  target div = k * max(volume-1,0)/dt" % [_get_density_correction_strength()]
 	if param_labels.has("underfill_correction"):
-		param_labels["underfill_correction"].text = "internal underfill strength: %.2f  only internal mass<1 gets negative div" % [_get_underfill_correction_strength()]
+		param_labels["underfill_correction"].text = "internal underfill strength: %.2f  only internal volume<1 gets negative div" % [_get_underfill_correction_strength()]
 	if param_labels.has("inject_horizontal_speed"):
 		param_labels["inject_horizontal_speed"].text = "LMB water initial horizontal speed: %.1f" % [inject_horizontal_speed]
 
@@ -158,6 +164,7 @@ func _process(_delta: float) -> void:
 	if world == null:
 		return
 	_handle_keyboard()
+	_handle_rigid_drag()
 	_handle_mouse_paint()
 	_update_param_labels()
 	_update_info()
@@ -167,6 +174,10 @@ func _handle_keyboard() -> void:
 		world.set_paused(not world.is_paused())
 	if Input.is_action_just_pressed("ui_cancel"):
 		world.generate_basin()
+	var t_down := Input.is_key_pressed(KEY_T)
+	if t_down and not rigid_test_key_was_down and world.has_method("generate_rigid_collision_test"):
+		world.generate_rigid_collision_test()
+	rigid_test_key_was_down = t_down
 	if Input.is_key_pressed(KEY_F11):
 		_enter_fullscreen()
 	if Input.is_key_pressed(KEY_1):
@@ -175,6 +186,22 @@ func _handle_keyboard() -> void:
 		brush_material = 1 # rock
 	if Input.is_key_pressed(KEY_3):
 		brush_material = 0 # air/erase
+	if Input.is_key_pressed(KEY_4):
+		brush_material = 3 # sand
+	if Input.is_key_pressed(KEY_5):
+		brush_material = 4 # smoke
+	if Input.is_key_pressed(KEY_6):
+		brush_material = 5 # toxic
+	if Input.is_key_pressed(KEY_7):
+		brush_material = 6 # oil
+	if Input.is_key_pressed(KEY_8):
+		brush_material = 7 # fire
+	if Input.is_key_pressed(KEY_9):
+		brush_material = 8 # steam
+	if Input.is_key_pressed(KEY_0):
+		brush_material = 9 # toxic gas
+	if Input.is_key_pressed(KEY_F):
+		brush_material = 10 # flammable gas
 	if Input.is_key_pressed(KEY_EQUAL):
 		brush_radius = min(30.0, brush_radius + 0.25)
 	if Input.is_key_pressed(KEY_MINUS):
@@ -184,10 +211,35 @@ func _handle_keyboard() -> void:
 	if Input.is_key_pressed(KEY_BRACKETRIGHT):
 		world.set_pressure_iterations(world.get_pressure_iterations() + 1)
 
+
+func _mouse_local_position() -> Vector2:
+	return (get_viewport().get_mouse_position() - world.global_position) / float(world.get_display_scale())
+
+func _handle_rigid_drag() -> void:
+	if world == null or not world.has_method("start_rigid_drag"):
+		return
+	var local := _mouse_local_position()
+	if Input.is_mouse_button_pressed(MOUSE_BUTTON_MIDDLE):
+		if not rigid_dragging:
+			rigid_dragging = bool(world.start_rigid_drag(local.x, local.y))
+		elif world.has_method("update_rigid_drag"):
+			var rotate := Input.is_key_pressed(KEY_SHIFT)
+			world.update_rigid_drag(local.x, local.y, rotate)
+	elif rigid_dragging:
+		rigid_dragging = false
+		if world.has_method("end_rigid_drag"):
+			world.end_rigid_drag()
+
 func _handle_mouse_paint() -> void:
+	var lmb_down := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	if rigid_paint_stroke and (not lmb_down or brush_material != 1):
+		rigid_paint_stroke = false
+		if world.has_method("end_rigid_paint_stroke"):
+			world.end_rigid_paint_stroke()
+
 	var use_tool := false
 	var material := brush_material
-	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+	if lmb_down:
 		use_tool = true
 		material = brush_material
 	elif Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
@@ -196,7 +248,13 @@ func _handle_mouse_paint() -> void:
 	if not use_tool:
 		return
 
-	var local: Vector2 = (get_viewport().get_mouse_position() - world.global_position) / float(world.get_display_scale())
+	if rigid_dragging or Input.is_mouse_button_pressed(MOUSE_BUTTON_MIDDLE):
+		return
+	var local: Vector2 = _mouse_local_position()
+	if material == 1 and lmb_down and world.has_method("begin_rigid_paint_stroke"):
+		if not rigid_paint_stroke:
+			rigid_paint_stroke = true
+			world.begin_rigid_paint_stroke()
 	if material == 2 and abs(inject_horizontal_speed) > 0.001:
 		world.inject_water(local.x, local.y, brush_radius, 1.0, inject_horizontal_speed, 0.0)
 	else:
@@ -208,12 +266,30 @@ func _update_info() -> void:
 		mat_name = "Rock"
 	elif brush_material == 0:
 		mat_name = "Air"
+	elif brush_material == 3:
+		mat_name = "Sand"
+	elif brush_material == 4:
+		mat_name = "Smoke"
+	elif brush_material == 5:
+		mat_name = "Toxic"
+	elif brush_material == 6:
+		mat_name = "Oil"
+	elif brush_material == 7:
+		mat_name = "Fire"
+	elif brush_material == 8:
+		mat_name = "Steam"
+	elif brush_material == 9:
+		mat_name = "Toxic gas"
+	elif brush_material == 10:
+		mat_name = "Flammable gas"
 
 	var text := "MacWorld: MAC grid + explicit advection/viscosity + PCG pressure projection\n"
 	text += "FPS: %d | target sim: %.0f steps/s | total sim steps: %d | last step: %.3f ms\n" % [int(Engine.get_frames_per_second()), 60.0 * world.get_simulation_speed(), world.get_step_count(), world.get_last_step_ms()]
 	text += "dt: %.3f | gravity: %.2f | viscosity: %.3f | active: %.2f | over: %.2f | under: %.2f | PCG: %d/%d residual %.2e\n" % [world.get_dt(), world.get_gravity(), world.get_viscosity(), _get_pressure_active_mass(), _get_density_correction_strength(), _get_underfill_correction_strength(), world.get_last_pcg_iterations(), world.get_pressure_iterations(), world.get_last_pcg_residual()]
-	text += "water mass: %.1f | avg mass/water cell: %.3f | water cells: %d\n" % [world.get_total_water_mass(), world.get_average_water_mass(), world.get_water_cell_count()]
-	text += "paused: %s | Controls: Space pause, Esc reset, 1 water, 2 rock, 3 air, LMB paint/inject, RMB erase\n" % [str(world.is_paused())]
+	text += "liquid volume: %.1f | avg volume/liquid cell: %.3f | liquid cells: %d\n" % [world.get_total_water_mass(), world.get_average_water_mass(), world.get_water_cell_count()]
+	if world.has_method("get_rigid_body_count"):
+		text += "rigid bodies: %d | MMB drag body, Shift+MMB rotate picked body\n" % [world.get_rigid_body_count()]
+	text += "paused: %s | Controls: Space pause, Esc basin, T rigid collision test, 1 water, 2 rock, 3 air, 4 sand, 5 smoke, 6 toxic, 7 oil, 8 fire, 9 steam, 0 toxic gas, F flammable gas, LMB paint/inject, RMB erase, MMB drag rigid, Shift+MMB rotate\n" % [str(world.is_paused())]
 	text += "+/- brush, [/] PCG iters | Brush: %s radius %.1f | LMB water vx %.1f" % [mat_name, brush_radius, inject_horizontal_speed]
 	info_label.text = text
 
