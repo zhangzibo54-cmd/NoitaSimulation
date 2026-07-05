@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "world_grid.h"
 
@@ -29,3 +29,4 @@ private:
 public:
 	void step(WorldGrid &p_grid);
 };
+

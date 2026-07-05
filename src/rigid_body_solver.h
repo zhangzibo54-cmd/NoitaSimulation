@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "world_grid.h"
 
@@ -7,6 +7,17 @@
 #include <vector>
 
 class RigidBodySolver {
+public:
+	struct RigidCellOccupancy {
+		int32_t x = 0;
+		int32_t y = 0;
+		int32_t body_id = 0;
+		float vx = 0.0f;
+		float vy = 0.0f;
+		bool moving = false;
+		bool boundary = false;
+	};
+
 private:
 	struct BodyCell {
 		float lx = 0.0f;
@@ -142,6 +153,7 @@ private:
 	std::vector<int64_t> temp_keys;
 	std::vector<int32_t> temp_indices;
 	std::vector<int64_t> temp_pair_keys;
+	std::vector<RigidCellOccupancy> current_occupied_cells;
 	std::vector<int32_t> dirty_cells;
 	std::vector<int32_t> flood_queue;
 	std::vector<int32_t> island_cells;
@@ -188,8 +200,6 @@ private:
 	bool aabb_overlap_expanded(const RigidBody &p_a, const RigidBody &p_b, int32_t p_padding) const;
 	void update_sleep_state(const WorldGrid &p_grid, RigidBody &r_body, bool p_had_contact);
 	void bake_body_to_grid(WorldGrid &p_grid, RigidBody &r_body);
-	bool can_displace_into(const WorldGrid &p_grid, int32_t p_x, int32_t p_y) const;
-	bool displace_cell_from_rigid(WorldGrid &p_grid, int32_t p_x, int32_t p_y, float p_vx, float p_vy);
 	void populate_dynamic_cells(WorldGrid &p_grid);
 	int32_t find_body_at(float p_x, float p_y) const;
 
@@ -205,6 +215,7 @@ public:
 	void destroy_circle(WorldGrid &p_grid, float p_x, float p_y, float p_radius);
 	void spawn_collision_test(WorldGrid &p_grid);
 	void draw_overlay_rgba(const WorldGrid &p_grid, std::vector<uint8_t> &r_pixels) const;
+	const std::vector<RigidCellOccupancy> &get_current_occupied_cells() const;
 
 	bool start_drag(float p_x, float p_y);
 	void update_drag(float p_x, float p_y, bool p_rotate);
@@ -213,3 +224,4 @@ public:
 	int32_t get_awake_body_count() const;
 	int32_t get_sleeping_body_count() const;
 };
+

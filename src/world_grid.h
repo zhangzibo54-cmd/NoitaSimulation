@@ -13,7 +13,7 @@ public:
 	// Shared cell-centered state used by all solvers.
 	std::vector<uint8_t> material;
 	// Cell fill amount / occupied volume. This is not physical mass.
-	std::vector<float> volume;
+	std::vector<float> volume_fraction;
 	// Physical density-like material amount. For liquids this is derived from
 	// phase fractions; for sand/smoke it can store the old "amount" meaning.
 	std::vector<float> density;
@@ -68,3 +68,4 @@ public:
 	void make_flammable_gas(int32_t p_x, int32_t p_y, float p_mass = 1.0f);
 	void make_glass(int32_t p_x, int32_t p_y);
 };
+

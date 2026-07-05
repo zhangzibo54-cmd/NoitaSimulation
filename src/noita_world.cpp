@@ -824,3 +824,4 @@ double NoitaWorld::get_average_water_mass() const {
 double NoitaWorld::get_last_step_ms() const { return last_step_ms; }
 
 int64_t NoitaWorld::get_step_count() const { return static_cast<int64_t>(step_count); }
+

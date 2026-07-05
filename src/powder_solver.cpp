@@ -50,7 +50,7 @@ bool PowderSolver::try_move_sand(WorldGrid &p_grid, int32_t p_from_x, int32_t p_
 	}
 
 	const uint8_t dst_material = p_grid.material[to];
-	const float dst_mass = p_grid.volume[to];
+	const float dst_mass = p_grid.volume_fraction[to];
 	const float dst_density = p_grid.density[to];
 	const float dst_oil = p_grid.oil[to];
 	const float dst_toxic = p_grid.toxic[to];
@@ -61,7 +61,7 @@ bool PowderSolver::try_move_sand(WorldGrid &p_grid, int32_t p_from_x, int32_t p_
 	const float dst_life = p_grid.lifetime[to];
 
 	p_grid.material[to] = p_grid.material[from];
-	p_grid.volume[to] = p_grid.volume[from] > 0.0f ? p_grid.volume[from] : 1.0f;
+	p_grid.volume_fraction[to] = p_grid.volume_fraction[from] > 0.0f ? p_grid.volume_fraction[from] : 1.0f;
 	p_grid.toxic[to] = 0.0f;
 	p_grid.pressure[to] = 0.0f;
 	p_grid.velocity_x[to] = p_new_vx;
@@ -73,7 +73,7 @@ bool PowderSolver::try_move_sand(WorldGrid &p_grid, int32_t p_from_x, int32_t p_
 	// old sand cell becomes air. This gives a simple sand-sinks-through-water rule.
 	if (get_material_def(dst_material).liquid) {
 		p_grid.material[from] = dst_material;
-		p_grid.volume[from] = dst_mass;
+		p_grid.volume_fraction[from] = dst_mass;
 		p_grid.toxic[from] = dst_toxic;
 		p_grid.pressure[from] = dst_pressure;
 		p_grid.velocity_x[from] = dst_vx;
@@ -174,3 +174,4 @@ void PowderSolver::step(WorldGrid &p_grid) {
 		p_grid.velocity_y[idx] = 0.0f;
 	}
 }
+

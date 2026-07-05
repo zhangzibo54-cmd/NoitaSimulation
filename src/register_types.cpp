@@ -38,3 +38,4 @@ extern "C"
 		return init_obj.init();
 	}
 }
+

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "world_grid.h"
 
@@ -33,3 +33,4 @@ public:
 	MaterialReactionSolver();
 	void step(WorldGrid &p_grid);
 };
+

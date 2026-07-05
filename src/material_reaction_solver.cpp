@@ -1,4 +1,4 @@
-﻿#include "material_reaction_solver.h"
+#include "material_reaction_solver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -157,7 +157,7 @@ void MaterialReactionSolver::step(WorldGrid &p_grid) {
 			} else if (!has_neighbor_material(p_grid, x, y, rule.neighbor)) {
 				continue;
 			}
-			apply_output(p_grid, x, y, rule.output, std::max(0.05f, p_grid.volume[idx] * rule.output_volume));
+			apply_output(p_grid, x, y, rule.output, std::max(0.05f, p_grid.volume_fraction[idx] * rule.output_volume));
 			reacted = true;
 			break;
 		}
@@ -166,3 +166,4 @@ void MaterialReactionSolver::step(WorldGrid &p_grid) {
 		}
 	}
 }
+

@@ -19,16 +19,18 @@ func _ready() -> void:
 	world.position = Vector2(20, 36)
 	world.set_world_size(320, 180)
 	world.set_display_scale(3.0)
-	world.set_dt(0.18)
-	world.set_gravity(1.00)
+	world.set_dt(1.0 / 30.0)
+	world.set_gravity(120.0)
 	world.set_viscosity(0.04)
 	world.set_pressure_iterations(20)
 	if world.has_method("set_pressure_active_mass"):
-		world.set_pressure_active_mass(0.50)
+		world.set_pressure_active_mass(0.10)
 	if world.has_method("set_density_correction_strength"):
-		world.set_density_correction_strength(0.20)
+		world.set_density_correction_strength(0.02)
 	if world.has_method("set_underfill_correction_strength"):
-		world.set_underfill_correction_strength(0.30)
+		world.set_underfill_correction_strength(0.02)
+	if world.has_method("set_rigid_liquid_impulse_strength"):
+		world.set_rigid_liquid_impulse_strength(0.45)
 	world.set_simulation_speed(1.0)
 	if world.has_method("generate_rigid_collision_test"):
 		world.generate_rigid_collision_test()
@@ -77,19 +79,27 @@ func _fit_world_to_viewport() -> void:
 
 func _create_debug_panel(layer: CanvasLayer) -> void:
 	var panel := PanelContainer.new()
-	panel.position = Vector2(12, 135)
+	panel.position = Vector2(12, max(210.0, get_viewport_rect().size.y - 410.0))
+	var panel_style := StyleBoxFlat.new()
+	panel_style.bg_color = Color(0.02, 0.025, 0.035, 0.20)
+	panel_style.border_color = Color(0.45, 0.70, 1.0, 0.18)
+	panel_style.set_border_width_all(1)
+	panel_style.set_corner_radius_all(6)
+	panel.add_theme_stylebox_override("panel", panel_style)
 	layer.add_child(panel)
 
 	var box := VBoxContainer.new()
-	box.custom_minimum_size = Vector2(470, 0)
+	box.custom_minimum_size = Vector2(280, 0)
 	panel.add_child(box)
 
 	var title := Label.new()
 	title.text = "MAC grid + PCG pressure projection"
+	title.add_theme_color_override("font_color", Color(0.84, 0.92, 1.0, 0.82))
+	title.add_theme_font_size_override("font_size", 11)
 	box.add_child(title)
 
-	_add_slider(box, "dt", 0.02, 0.5, 0.01, world.get_dt())
-	_add_slider(box, "gravity", 0.0, 2.5, 0.01, world.get_gravity())
+	_add_slider(box, "dt", 1.0 / 120.0, 1.0 / 15.0, 0.001, world.get_dt())
+	_add_slider(box, "gravity", 0.0, 300.0, 1.0, world.get_gravity())
 	_add_slider(box, "viscosity", 0.0, 0.25, 0.005, world.get_viscosity())
 	_add_slider(box, "pressure_iterations", 1.0, 250.0, 1.0, world.get_pressure_iterations())
 	if world.has_method("get_pressure_active_mass"):
@@ -98,11 +108,15 @@ func _create_debug_panel(layer: CanvasLayer) -> void:
 		_add_slider(box, "density_correction", 0.0, 2.0, 0.01, world.get_density_correction_strength())
 	if world.has_method("get_underfill_correction_strength"):
 		_add_slider(box, "underfill_correction", 0.0, 2.0, 0.01, world.get_underfill_correction_strength())
-	_add_slider(box, "inject_horizontal_speed", -6.0, 6.0, 0.1, inject_horizontal_speed)
+	if world.has_method("get_rigid_liquid_impulse_strength"):
+		_add_slider(box, "rigid_liquid_impulse", 0.0, 3.0, 0.01, world.get_rigid_liquid_impulse_strength())
+	_add_slider(box, "inject_horizontal_speed", -60.0, 60.0, 1.0, inject_horizontal_speed)
 	_update_param_labels()
 
 func _add_slider(parent: VBoxContainer, key: String, min_value: float, max_value: float, step_value: float, value: float) -> void:
 	var label := Label.new()
+	label.add_theme_color_override("font_color", Color(0.86, 0.92, 1.0, 0.72))
+	label.add_theme_font_size_override("font_size", 10)
 	parent.add_child(label)
 	param_labels[key] = label
 
@@ -111,7 +125,8 @@ func _add_slider(parent: VBoxContainer, key: String, min_value: float, max_value
 	slider.max_value = max_value
 	slider.step = step_value
 	slider.value = value
-	slider.custom_minimum_size = Vector2(440, 0)
+	slider.custom_minimum_size = Vector2(260, 0)
+	slider.modulate = Color(0.78, 0.88, 1.0, 0.62)
 	slider.value_changed.connect(_on_param_slider_changed.bind(key))
 	parent.add_child(slider)
 
@@ -136,6 +151,9 @@ func _on_param_slider_changed(value: float, key: String) -> void:
 		"underfill_correction":
 			if world.has_method("set_underfill_correction_strength"):
 				world.set_underfill_correction_strength(value)
+		"rigid_liquid_impulse":
+			if world.has_method("set_rigid_liquid_impulse_strength"):
+				world.set_rigid_liquid_impulse_strength(value)
 		"inject_horizontal_speed":
 			inject_horizontal_speed = value
 	_update_param_labels()
@@ -144,9 +162,9 @@ func _update_param_labels() -> void:
 	if world == null:
 		return
 	if param_labels.has("dt"):
-		param_labels["dt"].text = "dt: %.3f tick" % [world.get_dt()]
+		param_labels["dt"].text = "fluid dt / target interval: %.4f s (%.1f Hz)" % [world.get_dt(), 1.0 / max(world.get_dt(), 0.0001)]
 	if param_labels.has("gravity"):
-		param_labels["gravity"].text = "gravity: %.2f cells/tick^2" % [world.get_gravity()]
+		param_labels["gravity"].text = "gravity: %.1f cells/s^2" % [world.get_gravity()]
 	if param_labels.has("viscosity"):
 		param_labels["viscosity"].text = "viscosity nu: %.3f" % [world.get_viscosity()]
 	if param_labels.has("pressure_iterations"):
@@ -157,8 +175,10 @@ func _update_param_labels() -> void:
 		param_labels["density_correction"].text = "density correction strength: %.2f  target div = k * max(volume-1,0)/dt" % [_get_density_correction_strength()]
 	if param_labels.has("underfill_correction"):
 		param_labels["underfill_correction"].text = "internal underfill strength: %.2f  only internal volume<1 gets negative div" % [_get_underfill_correction_strength()]
+	if param_labels.has("rigid_liquid_impulse"):
+		param_labels["rigid_liquid_impulse"].text = "rigid-liquid splash impulse: %.2f  displaced liquid gets outward momentum" % [_get_rigid_liquid_impulse_strength()]
 	if param_labels.has("inject_horizontal_speed"):
-		param_labels["inject_horizontal_speed"].text = "LMB water initial horizontal speed: %.1f" % [inject_horizontal_speed]
+		param_labels["inject_horizontal_speed"].text = "LMB water initial horizontal speed: %.1f cells/s" % [inject_horizontal_speed]
 
 func _process(_delta: float) -> void:
 	if world == null:
@@ -284,15 +304,19 @@ func _update_info() -> void:
 		mat_name = "Flammable gas"
 
 	var text := "MacWorld: MAC grid + explicit advection/viscosity + PCG pressure projection\n"
-	text += "FPS: %d | target sim: %.0f steps/s | total sim steps: %d | last step: %.3f ms\n" % [int(Engine.get_frames_per_second()), 60.0 * world.get_simulation_speed(), world.get_step_count(), world.get_last_step_ms()]
+	text += "FPS: %d | target fluid: %.1f steps/s | budget: 4.00 ms/frame | total sim steps: %d | last fluid step: %.2f ms\n" % [int(Engine.get_frames_per_second()), (1.0 / max(world.get_dt(), 0.0001)) * world.get_simulation_speed(), world.get_step_count(), world.get_last_step_ms()]
 	if world.has_method("get_last_sim_ms"):
 		var frame_steps: int = 1
 		var frame_sim_ms: float = float(world.get_last_sim_ms())
 		if world.has_method("get_last_frame_sim_steps"):
 			frame_steps = int(world.get_last_frame_sim_steps())
 			frame_sim_ms = float(world.get_last_frame_sim_ms())
-		text += "timing: sim %.3f ms | frame sim %d steps %.3f ms | fill RGBA %.3f ms | texture %.3f ms | measured total %.3f ms\n" % [world.get_last_sim_ms(), frame_steps, frame_sim_ms, world.get_last_fill_ms(), world.get_last_texture_ms(), frame_sim_ms + world.get_last_fill_ms() + world.get_last_texture_ms()]
-	text += "dt: %.3f | gravity: %.2f | viscosity: %.3f | active: %.2f | over: %.2f | under: %.2f | PCG: %d/%d residual %.2e\n" % [world.get_dt(), world.get_gravity(), world.get_viscosity(), _get_pressure_active_mass(), _get_density_correction_strength(), _get_underfill_correction_strength(), world.get_last_pcg_iterations(), world.get_pressure_iterations(), world.get_last_pcg_residual()]
+		text += "timing: sim %.2f ms | frame sim %d steps %.2f ms | fill RGBA %.2f ms | texture %.2f ms | measured total %.2f ms\n" % [world.get_last_sim_ms(), frame_steps, frame_sim_ms, world.get_last_fill_ms(), world.get_last_texture_ms(), frame_sim_ms + world.get_last_fill_ms() + world.get_last_texture_ms()]
+	if world.has_method("get_last_predict_ms"):
+		text += "fluid phases: predict %.2f | build %.2f | pcg %.2f | project %.2f | advect %.2f | clamp %.2f | total %.2f ms\n" % [world.get_last_predict_ms(), world.get_last_build_ms(), world.get_last_pcg_ms(), world.get_last_project_ms(), world.get_last_advect_ms(), world.get_last_clamp_ms(), world.get_last_step_ms()]
+	if world.has_method("get_active_region_pad"):
+		text += "fluid active rect: (%d,%d)-(%d,%d) pad %d | max speed %.2f cells/tick\n" % [world.get_active_region_min_x(), world.get_active_region_min_y(), world.get_active_region_max_x(), world.get_active_region_max_y(), world.get_active_region_pad(), world.get_active_region_max_speed()]
+	text += "dt: %.3f | gravity: %.2f | viscosity: %.3f | active: %.2f | over: %.2f | under: %.2f | splash: %.2f | PCG: %d/%d residual %.2e\n" % [world.get_dt(), world.get_gravity(), world.get_viscosity(), _get_pressure_active_mass(), _get_density_correction_strength(), _get_underfill_correction_strength(), _get_rigid_liquid_impulse_strength(), world.get_last_pcg_iterations(), world.get_pressure_iterations(), world.get_last_pcg_residual()]
 	text += "liquid volume: %.1f | avg volume/liquid cell: %.3f | liquid cells: %d\n" % [world.get_total_water_mass(), world.get_average_water_mass(), world.get_water_cell_count()]
 	if world.has_method("get_rigid_body_count"):
 		var awake_count: int = int(world.get_rigid_awake_count()) if world.has_method("get_rigid_awake_count") else -1
@@ -316,3 +340,8 @@ func _get_underfill_correction_strength() -> float:
 	if world != null and world.has_method("get_underfill_correction_strength"):
 		return float(world.get_underfill_correction_strength())
 	return 0.0
+
+func _get_rigid_liquid_impulse_strength() -> float:
+	if world != null and world.has_method("get_rigid_liquid_impulse_strength"):
+		return float(world.get_rigid_liquid_impulse_strength())
+	return 0.45

@@ -131,3 +131,4 @@ public:
 	double get_last_step_ms() const;
 	int64_t get_step_count() const;
 };
+

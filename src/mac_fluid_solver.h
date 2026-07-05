@@ -2,6 +2,7 @@
 
 #include "world_grid.h"
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -23,28 +24,56 @@ private:
 		float d_inv = 1.0f;
 	};
 
+	enum class StepPhase : uint8_t {
+		IDLE,
+		PREDICT,
+		BUILD,
+		PCG,
+		PROJECT,
+		ADVECT,
+		CLAMP,
+	};
+
 	WorldGrid *world = nullptr;
 	int32_t width = 320;
 	int32_t height = 180;
 
-	float dt = 0.18f;
-	float gravity = 0.75f;
+	float dt = 1.0f / 30.0f;
+	float gravity = 120.0f;
 	float viscosity = 0.04f;
 	float density = 1.0f;
-	float target_mass = 1.0f;
+	float target_fill_fraction = 1.0f;
 	float pressure_active_mass = 0.30f;
 	float density_correction_strength = 0.5f;
 	float underfill_correction_strength = 0.2f;
 	float immiscible_bias_strength = 0.35f;
 	float oil_buoyancy_bias_strength = 0.25f;
 	float velocity_damping = 0.998f;
-	float max_velocity = 6.0f;
+	float max_velocity = 30.0f;
 	int32_t pressure_iterations = 20;
 
 	double last_step_ms = 0.0;
+	double last_predict_ms = 0.0;
+	double last_build_ms = 0.0;
+	double last_pcg_ms = 0.0;
+	double last_project_ms = 0.0;
+	double last_advect_ms = 0.0;
+	double last_clamp_ms = 0.0;
 	uint64_t step_count = 0;
 	int32_t last_pcg_iterations = 0;
 	double last_pcg_residual = 0.0;
+
+	bool has_active_liquid = false;
+	bool had_active_liquid_last_step = false;
+	int32_t active_min_x = 0;
+	int32_t active_min_y = 0;
+	int32_t active_max_x = -1;
+	int32_t active_max_y = -1;
+	int32_t active_pad = 0;
+	float active_max_speed = 0.0f;
+	StepPhase step_phase = StepPhase::IDLE;
+	bool step_job_active = false;
+	std::chrono::high_resolution_clock::time_point step_job_start_time;
 
 	std::vector<float> next_mass;
 	std::vector<float> next_toxic;
@@ -56,6 +85,9 @@ private:
 	std::vector<float> z_vec;
 	std::vector<float> diag_inv;
 	std::vector<int32_t> active_cells;
+	std::vector<int32_t> active_liquid_source_indices;
+	std::vector<uint8_t> active_region_mask;
+	std::vector<int32_t> active_region_indices;
 	std::vector<uint8_t> pressure_active_mask;
 	std::vector<PressureStencilRow> pressure_rows;
 	std::vector<int32_t> pressure_row_index;
@@ -79,6 +111,10 @@ private:
 	std::vector<float> v_alpha;
 	std::vector<float> u_mass_flux;
 	std::vector<float> v_mass_flux;
+	std::vector<uint8_t> u_active_face_mask;
+	std::vector<uint8_t> v_active_face_mask;
+	std::vector<int32_t> active_u_faces;
+	std::vector<int32_t> active_v_faces;
 
 	int32_t cell_index(int32_t p_x, int32_t p_y) const;
 	int32_t u_index(int32_t p_x, int32_t p_y) const;
@@ -99,9 +135,13 @@ private:
 
 	void ensure_buffers();
 	void clear_fields();
+	bool compute_active_liquid_region();
 	void apply_solid_boundaries(std::vector<float> &p_u, std::vector<float> &p_v);
+	void apply_solid_boundaries_active(std::vector<float> &p_u, std::vector<float> &p_v);
 	float sample_u_clamped(const std::vector<float> &p_u, int32_t p_x, int32_t p_y) const;
 	float sample_v_clamped(const std::vector<float> &p_v, int32_t p_x, int32_t p_y) const;
+	float sample_pressure_volume_at(float p_world_x, float p_world_y) const;
+	float backtraced_pressure_volume(int32_t p_x, int32_t p_y) const;
 	float sample_u_bilinear(const std::vector<float> &p_u, float p_world_x, float p_world_y) const;
 	float sample_v_bilinear(const std::vector<float> &p_v, float p_world_x, float p_world_y) const;
 	float vertical_velocity_at_u_face(const std::vector<float> &p_v, int32_t p_x, int32_t p_y) const;
@@ -147,6 +187,9 @@ public:
 	double get_underfill_correction_strength() const;
 
 	void step();
+	void begin_step_job();
+	bool advance_step_job(double p_budget_ms);
+	bool has_pending_step_job() const;
 	void clear();
 	void generate_basin();
 	void paint_circle(double p_x, double p_y, double p_radius, int32_t p_material);
@@ -157,7 +200,20 @@ public:
 	int64_t get_water_cell_count() const;
 	double get_average_water_mass() const;
 	double get_last_step_ms() const;
+	double get_last_predict_ms() const;
+	double get_last_build_ms() const;
+	double get_last_pcg_ms() const;
+	double get_last_project_ms() const;
+	double get_last_advect_ms() const;
+	double get_last_clamp_ms() const;
+	int32_t get_active_region_min_x() const;
+	int32_t get_active_region_min_y() const;
+	int32_t get_active_region_max_x() const;
+	int32_t get_active_region_max_y() const;
+	int32_t get_active_region_pad() const;
+	double get_active_region_max_speed() const;
 	int64_t get_step_count() const;
 	int32_t get_last_pcg_iterations() const;
 	double get_last_pcg_residual() const;
 };
+

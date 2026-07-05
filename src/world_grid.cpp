@@ -10,7 +10,7 @@ void WorldGrid::set_size(int32_t p_width, int32_t p_height) {
 	height = std::max(16, p_height);
 	const int32_t count = cell_count();
 	material.assign(count, MATERIAL_AIR);
-	volume.assign(count, 0.0f);
+	volume_fraction.assign(count, 0.0f);
 	density.assign(count, get_material_def(MATERIAL_AIR).density);
 	toxic.assign(count, 0.0f);
 	oil.assign(count, 0.0f);
@@ -45,7 +45,7 @@ void WorldGrid::clear() {
 }
 
 void WorldGrid::clear_dynamic_fields() {
-	std::fill(volume.begin(), volume.end(), 0.0f);
+	std::fill(volume_fraction.begin(), volume_fraction.end(), 0.0f);
 	std::fill(density.begin(), density.end(), get_material_def(MATERIAL_AIR).density);
 	std::fill(toxic.begin(), toxic.end(), 0.0f);
 	std::fill(oil.begin(), oil.end(), 0.0f);
@@ -102,7 +102,7 @@ bool WorldGrid::is_liquid_cell(int32_t p_x, int32_t p_y, float p_mass_epsilon) c
 		return false;
 	}
 	const MaterialDef &def = get_material_def(material[i]);
-	return def.liquid && std::isfinite(volume[i]) && volume[i] > p_mass_epsilon;
+	return def.liquid && std::isfinite(volume_fraction[i]) && volume_fraction[i] > p_mass_epsilon;
 }
 
 bool WorldGrid::is_powder_cell(int32_t p_x, int32_t p_y) const {
@@ -136,13 +136,13 @@ void WorldGrid::rebuild_active_cells(float p_liquid_mass_epsilon) {
 	const int32_t count = cell_count();
 	for (int32_t i = 0; i < count; i++) {
 		const MaterialDef &def = get_material_def(material[i]);
-		if (rigid_body_id[i] == 0 && def.liquid && std::isfinite(volume[i]) && volume[i] > p_liquid_mass_epsilon) {
+		if (rigid_body_id[i] == 0 && def.liquid && std::isfinite(volume_fraction[i]) && volume_fraction[i] > p_liquid_mass_epsilon) {
 			active_liquid_cells.push_back(i);
 		}
 		if (def.powder) {
 			active_powder_cells.push_back(i);
 		}
-		if (rigid_body_id[i] == 0 && def.gas && std::isfinite(volume[i]) && volume[i] > 0.001f) {
+		if (rigid_body_id[i] == 0 && def.gas && std::isfinite(volume_fraction[i]) && volume_fraction[i] > 0.001f) {
 			active_gas_cells.push_back(i);
 		}
 		if (material[i] == MATERIAL_FIRE) {
@@ -160,7 +160,7 @@ void WorldGrid::make_rock(int32_t p_x, int32_t p_y) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_ROCK;
-	volume[i] = 0.0f;
+	volume_fraction[i] = 0.0f;
 	density[i] = get_material_def(MATERIAL_ROCK).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -177,7 +177,7 @@ void WorldGrid::make_air(int32_t p_x, int32_t p_y) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_AIR;
-	volume[i] = 0.0f;
+	volume_fraction[i] = 0.0f;
 	density[i] = get_material_def(MATERIAL_AIR).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -194,7 +194,7 @@ void WorldGrid::make_water(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_WATER;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = get_material_def(MATERIAL_WATER).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -206,9 +206,9 @@ void WorldGrid::make_toxic(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_TOXIC;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = get_material_def(MATERIAL_TOXIC).density;
-	toxic[i] = volume[i];
+	toxic[i] = volume_fraction[i];
 	oil[i] = 0.0f;
 }
 
@@ -218,10 +218,10 @@ void WorldGrid::make_oil(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_OIL;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = get_material_def(MATERIAL_OIL).density;
 	toxic[i] = 0.0f;
-	oil[i] = volume[i];
+	oil[i] = volume_fraction[i];
 }
 
 void WorldGrid::make_sand(int32_t p_x, int32_t p_y, float p_mass) {
@@ -230,7 +230,7 @@ void WorldGrid::make_sand(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_SAND;
-	volume[i] = 1.0f;
+	volume_fraction[i] = 1.0f;
 	density[i] = std::max(get_material_def(MATERIAL_SAND).density, p_mass);
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -245,7 +245,7 @@ void WorldGrid::make_smoke(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_SMOKE;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = std::max(get_material_def(MATERIAL_SMOKE).density, p_mass);
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -261,7 +261,7 @@ void WorldGrid::make_fire(int32_t p_x, int32_t p_y, float p_heat) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_FIRE;
-	volume[i] = 1.0f;
+	volume_fraction[i] = 1.0f;
 	density[i] = get_material_def(MATERIAL_FIRE).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -278,7 +278,7 @@ void WorldGrid::make_steam(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_STEAM;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = get_material_def(MATERIAL_STEAM).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -295,9 +295,9 @@ void WorldGrid::make_toxic_gas(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_TOXIC_GAS;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = get_material_def(MATERIAL_TOXIC_GAS).density;
-	toxic[i] = volume[i];
+	toxic[i] = volume_fraction[i];
 	oil[i] = 0.0f;
 	pressure[i] = 0.0f;
 	velocity_x[i] = 0.0f;
@@ -312,7 +312,7 @@ void WorldGrid::make_flammable_gas(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_FLAMMABLE_GAS;
-	volume[i] = std::max(0.0f, p_mass);
+	volume_fraction[i] = std::max(0.0f, p_mass);
 	density[i] = get_material_def(MATERIAL_FLAMMABLE_GAS).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -329,7 +329,7 @@ void WorldGrid::make_glass(int32_t p_x, int32_t p_y) {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	material[i] = MATERIAL_GLASS;
-	volume[i] = 0.0f;
+	volume_fraction[i] = 0.0f;
 	density[i] = get_material_def(MATERIAL_GLASS).density;
 	toxic[i] = 0.0f;
 	oil[i] = 0.0f;
@@ -339,3 +339,5 @@ void WorldGrid::make_glass(int32_t p_x, int32_t p_y) {
 	temperature[i] = std::max(temperature[i], 0.45f);
 	lifetime[i] = 0.0f;
 }
+
+

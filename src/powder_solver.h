@@ -21,3 +21,4 @@ private:
 public:
 	void step(WorldGrid &p_grid);
 };
+

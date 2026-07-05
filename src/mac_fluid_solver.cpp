@@ -23,6 +23,10 @@ float hash01(int32_t x, int32_t y, int32_t seed) {
 	h ^= h >> 16;
 	return static_cast<float>(h & 0x00ffffffu) / static_cast<float>(0x01000000u);
 }
+
+double elapsed_ms(std::chrono::high_resolution_clock::time_point p_start, std::chrono::high_resolution_clock::time_point p_end) {
+	return std::chrono::duration<double, std::milli>(p_end - p_start).count();
+}
 } // namespace
 
 MacFluidSolver::MacFluidSolver() = default;
@@ -66,7 +70,7 @@ bool MacFluidSolver::is_liquid_cell(int32_t p_x, int32_t p_y) const {
 		return false;
 	}
 	const MaterialDef &def = get_material_def(world->material[i]);
-	return def.liquid && std::isfinite(world->volume[i]) && world->volume[i] > MASS_EPSILON;
+	return def.liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > MASS_EPSILON;
 }
 
 bool MacFluidSolver::is_internal_liquid_cell(int32_t p_x, int32_t p_y) const {
@@ -84,7 +88,7 @@ bool MacFluidSolver::is_internal_liquid_cell(int32_t p_x, int32_t p_y) const {
 			continue;
 		}
 		int32_t ni = cell_index(nx[k], ny[k]);
-		if (!std::isfinite(world->volume[ni]) || world->volume[ni] <= pressure_active_mass) {
+		if (!std::isfinite(world->volume_fraction[ni]) || world->volume_fraction[ni] <= pressure_active_mass) {
 			return false;
 		}
 	}
@@ -100,15 +104,29 @@ bool MacFluidSolver::is_pressure_active_cell(int32_t p_x, int32_t p_y) const {
 		return false;
 	}
 	const MaterialDef &def = get_material_def(world->material[i]);
-	if (!def.pressure_solved || def.blocks_velocity) {
+	if (def.blocks_velocity) {
 		return false;
 	}
-	float m = world->volume[i];
-	return std::isfinite(m) && (m > pressure_active_mass || is_internal_liquid_cell(p_x, p_y));
+	float m = world->volume_fraction[i];
+	// Time-layer guard for semi-Lagrangian velocity advection:
+	// velocity has already been transported by dt before pressure projection,
+	// but volume will be advected after projection.  A fast-moving liquid front
+	// can therefore arrive at a cell whose current volume is still below the
+	// threshold.  Treat the cell as pressure-active if either the current cell
+	// is above threshold or its backtraced source position was above threshold.
+	const float source_m = backtraced_pressure_volume(p_x, p_y);
+	const bool current_active = def.pressure_solved && std::isfinite(m) &&
+			(m > pressure_active_mass || is_internal_liquid_cell(p_x, p_y));
+	return current_active ||
+			(std::isfinite(source_m) && source_m > pressure_active_mass);
 }
 
 bool MacFluidSolver::is_pressure_active_masked(int32_t p_x, int32_t p_y) const {
-	return in_bounds(p_x, p_y) && pressure_active_mask[cell_index(p_x, p_y)] != 0;
+	if (!in_bounds(p_x, p_y)) {
+		return false;
+	}
+	const int32_t i = cell_index(p_x, p_y);
+	return active_region_mask[i] != 0 && pressure_active_mask[i] != 0;
 }
 
 bool MacFluidSolver::u_face_blocked(int32_t p_x, int32_t p_y) const {
@@ -131,11 +149,17 @@ float MacFluidSolver::cell_density(int32_t p_x, int32_t p_y) const {
 	}
 	const int32_t i = cell_index(p_x, p_y);
 	const MaterialDef &def = get_material_def(world->material[i]);
-	if (def.liquid && std::isfinite(world->volume[i]) && world->volume[i] > MASS_EPSILON) {
+	if (def.liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > MASS_EPSILON) {
 		const float oil_f = oil_fraction_at(i);
 		const float water_rho = get_material_def(MATERIAL_WATER).density;
 		const float oil_rho = get_material_def(MATERIAL_OIL).density;
 		return std::max((water_rho * (1.0f - oil_f) + oil_rho * oil_f) * density, 1.0e-6f);
+	}
+	if (!def.blocks_velocity && backtraced_pressure_volume(p_x, p_y) > pressure_active_mass) {
+		// If this is an air/low-volume destination cell made active by the
+		// backtraced-source OR gate, use liquid density for the pressure matrix.
+		// Otherwise alpha=dt/rho_air would over-amplify projection impulses.
+		return std::max(get_material_def(MATERIAL_WATER).density * density, 1.0e-6f);
 	}
 	return std::max(world->density[i] * density, 1.0e-6f);
 }
@@ -144,7 +168,7 @@ float MacFluidSolver::oil_fraction_at(int32_t p_index) const {
 	if (world == nullptr || p_index < 0 || p_index >= width * height) {
 		return 0.0f;
 	}
-	const float vol = std::max(world->volume[p_index], MASS_EPSILON);
+	const float vol = std::max(world->volume_fraction[p_index], MASS_EPSILON);
 	return clampf(world->oil[p_index] / vol, 0.0f, 1.0f);
 }
 float MacFluidSolver::u_face_alpha(int32_t p_x, int32_t p_y) const {
@@ -203,13 +227,16 @@ void MacFluidSolver::ensure_buffers() {
 
 	next_mass.resize(cell_count, 0.0f);
 	next_toxic.resize(cell_count, 0.0f);
-	 next_oil.resize(cell_count, 0.0f);
+	next_oil.resize(cell_count, 0.0f);
 	rhs.resize(cell_count, 0.0f);
 	residual.resize(cell_count, 0.0f);
 	direction.resize(cell_count, 0.0f);
 	q_vec.resize(cell_count, 0.0f);
 	z_vec.resize(cell_count, 0.0f);
 	diag_inv.resize(cell_count, 0.0f);
+	active_region_mask.resize(cell_count, 0);
+	active_region_indices.clear();
+	active_region_indices.reserve(cell_count);
 	pressure_active_mask.resize(cell_count, 0);
 	pressure_row_index.resize(cell_count, -1);
 	pressure_rows.clear();
@@ -223,17 +250,25 @@ void MacFluidSolver::ensure_buffers() {
 	outflow_mass.resize(cell_count, 0.0f);
 	active_cells.clear();
 	active_cells.reserve(cell_count);
+	active_liquid_source_indices.clear();
+	active_liquid_source_indices.reserve(cell_count);
 
 	u.resize(u_count, 0.0f);
 	u_tmp.resize(u_count, 0.0f);
 	u_advected.resize(u_count, 0.0f);
 	u_alpha.resize(u_count, 0.0f);
 	u_mass_flux.resize(u_count, 0.0f);
+	u_active_face_mask.resize(u_count, 0);
 	v.resize(v_count, 0.0f);
 	v_tmp.resize(v_count, 0.0f);
 	v_advected.resize(v_count, 0.0f);
 	v_alpha.resize(v_count, 0.0f);
 	v_mass_flux.resize(v_count, 0.0f);
+	v_active_face_mask.resize(v_count, 0);
+	active_u_faces.clear();
+	active_u_faces.reserve(u_count);
+	active_v_faces.clear();
+	active_v_faces.reserve(v_count);
 }
 
 void MacFluidSolver::clear_fields() {
@@ -244,6 +279,9 @@ void MacFluidSolver::clear_fields() {
 	std::fill(next_mass.begin(), next_mass.end(), 0.0f);
 	std::fill(next_toxic.begin(), next_toxic.end(), 0.0f);
 	std::fill(next_oil.begin(), next_oil.end(), 0.0f);
+	std::fill(active_region_mask.begin(), active_region_mask.end(), 0);
+	std::fill(u_active_face_mask.begin(), u_active_face_mask.end(), 0);
+	std::fill(v_active_face_mask.begin(), v_active_face_mask.end(), 0);
 	std::fill(rhs.begin(), rhs.end(), 0.0f);
 	std::fill(outflow_mass.begin(), outflow_mass.end(), 0.0f);
 	std::fill(u.begin(), u.end(), 0.0f);
@@ -257,10 +295,184 @@ void MacFluidSolver::clear_fields() {
 	std::fill(u_mass_flux.begin(), u_mass_flux.end(), 0.0f);
 	std::fill(v_mass_flux.begin(), v_mass_flux.end(), 0.0f);
 	active_cells.clear();
+	active_liquid_source_indices.clear();
+	active_region_indices.clear();
+	active_u_faces.clear();
+	active_v_faces.clear();
 	pressure_rows.clear();
 	mic_rows.clear();
 	mic_diag.clear();
 	mic_temp.clear();
+	has_active_liquid = false;
+	had_active_liquid_last_step = false;
+	active_min_x = 0;
+	active_min_y = 0;
+	active_max_x = -1;
+	active_max_y = -1;
+	active_pad = 0;
+	active_max_speed = 0.0f;
+	step_phase = StepPhase::IDLE;
+	step_job_active = false;
+}
+
+bool MacFluidSolver::compute_active_liquid_region() {
+	for (int32_t i : active_region_indices) {
+		active_region_mask[i] = 0;
+	}
+	active_region_indices.clear();
+	for (int32_t idx : active_u_faces) {
+		u_active_face_mask[idx] = 0;
+	}
+	active_u_faces.clear();
+	for (int32_t idx : active_v_faces) {
+		v_active_face_mask[idx] = 0;
+	}
+	active_v_faces.clear();
+	active_liquid_source_indices.clear();
+
+	has_active_liquid = false;
+	active_min_x = width;
+	active_min_y = height;
+	active_max_x = -1;
+	active_max_y = -1;
+	active_pad = 0;
+	active_max_speed = 0.0f;
+
+	for (int32_t y = 0; y < height; y++) {
+		for (int32_t x = 0; x < width; x++) {
+			const int32_t i = cell_index(x, y);
+			if (world->rigid_body_id[i] != 0) {
+				continue;
+			}
+			const MaterialDef &def = get_material_def(world->material[i]);
+			if (!def.liquid || !std::isfinite(world->volume_fraction[i]) || world->volume_fraction[i] <= MASS_EPSILON) {
+				continue;
+			}
+			has_active_liquid = true;
+			active_liquid_source_indices.push_back(i);
+			active_min_x = std::min(active_min_x, x);
+			active_min_y = std::min(active_min_y, y);
+			active_max_x = std::max(active_max_x, x);
+			active_max_y = std::max(active_max_y, y);
+
+			const float vx = 0.5f * (u[u_index(x, y)] + u[u_index(x + 1, y)]);
+			const float vy = 0.5f * (v[v_index(x, y)] + v[v_index(x, y + 1)]);
+			if (std::isfinite(vx) && std::isfinite(vy)) {
+				active_max_speed = std::max(active_max_speed, std::sqrt(vx * vx + vy * vy));
+			}
+		}
+	}
+
+	if (!has_active_liquid) {
+		active_min_x = 0;
+		active_min_y = 0;
+		active_max_x = -1;
+		active_max_y = -1;
+		return false;
+	}
+
+	active_pad = std::max(3, static_cast<int32_t>(std::ceil(active_max_speed * dt * 1.5f)) + 3);
+
+	active_min_x = width;
+	active_min_y = height;
+	active_max_x = -1;
+	active_max_y = -1;
+
+	auto add_active_cell = [&](int32_t x, int32_t y) {
+		if (!in_bounds(x, y)) {
+			return;
+		}
+		const int32_t i = cell_index(x, y);
+		if (active_region_mask[i] != 0) {
+			return;
+		}
+		active_region_mask[i] = 1;
+		active_region_indices.push_back(i);
+		active_min_x = std::min(active_min_x, x);
+		active_min_y = std::min(active_min_y, y);
+		active_max_x = std::max(active_max_x, x);
+		active_max_y = std::max(active_max_y, y);
+	};
+
+	for (int32_t i : active_liquid_source_indices) {
+		const int32_t cx = i % width;
+		const int32_t cy = i / width;
+		for (int32_t y = cy - active_pad; y <= cy + active_pad; y++) {
+			for (int32_t x = cx - active_pad; x <= cx + active_pad; x++) {
+				add_active_cell(x, y);
+			}
+		}
+	}
+
+	auto add_u_face = [&](int32_t x, int32_t y) {
+		if (x < 0 || x > width || y < 0 || y >= height) {
+			return;
+		}
+		const int32_t idx = u_index(x, y);
+		if (u_active_face_mask[idx] == 0) {
+			u_active_face_mask[idx] = 1;
+			active_u_faces.push_back(idx);
+		}
+	};
+
+	auto add_v_face = [&](int32_t x, int32_t y) {
+		if (x < 0 || x >= width || y < 0 || y > height) {
+			return;
+		}
+		const int32_t idx = v_index(x, y);
+		if (v_active_face_mask[idx] == 0) {
+			v_active_face_mask[idx] = 1;
+			active_v_faces.push_back(idx);
+		}
+	};
+
+	for (int32_t i : active_region_indices) {
+		const int32_t x = i % width;
+		const int32_t y = i / width;
+		add_u_face(x, y);
+		add_u_face(x + 1, y);
+		add_v_face(x, y);
+		add_v_face(x, y + 1);
+	}
+
+	if (active_region_indices.empty()) {
+		active_min_x = 0;
+		active_min_y = 0;
+		active_max_x = -1;
+		active_max_y = -1;
+		return false;
+	}
+
+	std::sort(active_region_indices.begin(), active_region_indices.end());
+	std::sort(active_u_faces.begin(), active_u_faces.end());
+	std::sort(active_v_faces.begin(), active_v_faces.end());
+
+	for (int32_t i : active_region_indices) {
+		const int32_t x = i % width;
+		const int32_t y = i / width;
+		active_min_x = std::min(active_min_x, x);
+		active_min_y = std::min(active_min_y, y);
+		active_max_x = std::max(active_max_x, x);
+		active_max_y = std::max(active_max_y, y);
+	}
+
+	// Clear stale per-step scalar fields only on cells/faces that will be read
+	// this step.  Values outside the active mask are ignored by mask checks.
+	for (int32_t i : active_region_indices) {
+		rhs[i] = 0.0f;
+		diag_inv[i] = 0.0f;
+		pressure_active_mask[i] = 0;
+		outflow_mass[i] = 0.0f;
+	}
+	for (int32_t idx : active_u_faces) {
+		u_alpha[idx] = 0.0f;
+		u_mass_flux[idx] = 0.0f;
+	}
+	for (int32_t idx : active_v_faces) {
+		v_alpha[idx] = 0.0f;
+		v_mass_flux[idx] = 0.0f;
+		}
+	return true;
 }
 
 void MacFluidSolver::apply_solid_boundaries(std::vector<float> &p_u, std::vector<float> &p_v) {
@@ -280,6 +492,26 @@ void MacFluidSolver::apply_solid_boundaries(std::vector<float> &p_u, std::vector
 	}
 }
 
+void MacFluidSolver::apply_solid_boundaries_active(std::vector<float> &p_u, std::vector<float> &p_v) {
+	if (!has_active_liquid) {
+		return;
+	}
+	for (int32_t idx : active_u_faces) {
+		const int32_t y = idx / (width + 1);
+		const int32_t x = idx - y * (width + 1);
+		if (u_face_blocked(x, y)) {
+			p_u[idx] = 0.0f;
+		}
+	}
+	for (int32_t idx : active_v_faces) {
+		const int32_t y = idx / width;
+		const int32_t x = idx - y * width;
+		if (v_face_blocked(x, y)) {
+			p_v[idx] = 0.0f;
+		}
+	}
+}
+
 float MacFluidSolver::sample_u_clamped(const std::vector<float> &p_u, int32_t p_x, int32_t p_y) const {
 	p_x = std::max(0, std::min(p_x, width));
 	p_y = std::max(0, std::min(p_y, height - 1));
@@ -290,6 +522,58 @@ float MacFluidSolver::sample_v_clamped(const std::vector<float> &p_v, int32_t p_
 	p_x = std::max(0, std::min(p_x, width - 1));
 	p_y = std::max(0, std::min(p_y, height));
 	return p_v[v_index(p_x, p_y)];
+}
+
+float MacFluidSolver::sample_pressure_volume_at(float p_world_x, float p_world_y) const {
+	// Cell-centered bilinear sample.  Unlike velocity sampling, samples outside
+	// the grid or inside non-pressure materials contribute 0 instead of clamping
+	// to the boundary, because outside/solid is not an incoming liquid source.
+	const float fx = p_world_x - 0.5f;
+	const float fy = p_world_y - 0.5f;
+	const int32_t x0 = static_cast<int32_t>(std::floor(fx));
+	const int32_t y0 = static_cast<int32_t>(std::floor(fy));
+	const float tx = fx - static_cast<float>(x0);
+	const float ty = fy - static_cast<float>(y0);
+
+	auto sample = [&](int32_t sx, int32_t sy) -> float {
+		if (!in_bounds(sx, sy)) {
+			return 0.0f;
+		}
+		const int32_t si = cell_index(sx, sy);
+		if (world->rigid_body_id[si] != 0) {
+			return 0.0f;
+		}
+		const MaterialDef &def = get_material_def(world->material[si]);
+		if (!def.pressure_solved || def.blocks_velocity || !std::isfinite(world->volume_fraction[si])) {
+			return 0.0f;
+		}
+		return std::max(0.0f, world->volume_fraction[si]);
+	};
+
+	const float a = sample(x0, y0);
+	const float b = sample(x0 + 1, y0);
+	const float c = sample(x0, y0 + 1);
+	const float d = sample(x0 + 1, y0 + 1);
+	const float ab = a + (b - a) * tx;
+	const float cd = c + (d - c) * tx;
+	return ab + (cd - ab) * ty;
+}
+
+float MacFluidSolver::backtraced_pressure_volume(int32_t p_x, int32_t p_y) const {
+	if (!in_bounds(p_x, p_y)) {
+		return 0.0f;
+	}
+	// Use the same simulation dt as the velocity advection step.  If pressure
+	// projection is later split into its own 0.05s cadence/substep, this
+	// displacement must use that substep's effective dt instead.
+	const float cx = static_cast<float>(p_x) + 0.5f;
+	const float cy = static_cast<float>(p_y) + 0.5f;
+	const float vx = 0.5f * (u_tmp[u_index(p_x, p_y)] + u_tmp[u_index(p_x + 1, p_y)]);
+	const float vy = 0.5f * (v_tmp[v_index(p_x, p_y)] + v_tmp[v_index(p_x, p_y + 1)]);
+	if (!std::isfinite(vx) || !std::isfinite(vy)) {
+		return 0.0f;
+	}
+	return sample_pressure_volume_at(cx - dt * vx, cy - dt * vy);
 }
 
 float MacFluidSolver::sample_u_bilinear(const std::vector<float> &p_u, float p_world_x, float p_world_y) const {
@@ -353,12 +637,9 @@ void MacFluidSolver::predict_velocity_explicit() {
 	// convective term (U · grad)U: trace each MAC face backward through the old
 	// velocity field and copy the velocity carried by the fluid parcel that
 	// arrives at this face.
-	u_advected = u;
-	v_advected = v;
-
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x <= width; x++) {
-			int32_t idx = u_index(x, y);
+	for (int32_t idx : active_u_faces) {
+			const int32_t y = idx / (width + 1);
+			const int32_t x = idx - y * (width + 1);
 			if (u_face_blocked(x, y)) {
 				u_advected[idx] = 0.0f;
 				continue;
@@ -372,12 +653,11 @@ void MacFluidSolver::predict_velocity_explicit() {
 			const float vel_x = u[idx];
 			const float vel_y = vertical_velocity_at_u_face(v, x, y);
 			u_advected[idx] = sample_u_bilinear(u, face_x - dt * vel_x, face_y - dt * vel_y);
-		}
 	}
 
-	for (int32_t y = 1; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
-			int32_t idx = v_index(x, y);
+	for (int32_t idx : active_v_faces) {
+			const int32_t y = idx / width;
+			const int32_t x = idx - y * width;
 			if (v_face_blocked(x, y)) {
 				v_advected[idx] = 0.0f;
 				continue;
@@ -391,17 +671,17 @@ void MacFluidSolver::predict_velocity_explicit() {
 			const float vel_x = horizontal_velocity_at_v_face(u, x, y);
 			const float vel_y = v[idx];
 			v_advected[idx] = sample_v_bilinear(v, face_x - dt * vel_x, face_y - dt * vel_y);
-		}
 	}
 
-	apply_solid_boundaries(u_advected, v_advected);
+	apply_solid_boundaries_active(u_advected, v_advected);
 
-	u_tmp = u_advected;
-	v_tmp = v_advected;
-
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 1; x < width; x++) {
-			int32_t idx = u_index(x, y);
+	for (int32_t idx : active_u_faces) {
+			const int32_t y = idx / (width + 1);
+			const int32_t x = idx - y * (width + 1);
+			if (x <= 0 || x >= width) {
+				u_tmp[idx] = 0.0f;
+				continue;
+			}
 			if (!is_liquid_cell(x - 1, y) && !is_liquid_cell(x, y)) {
 				u_tmp[idx] = 0.0f;
 				continue;
@@ -410,12 +690,15 @@ void MacFluidSolver::predict_velocity_explicit() {
 			float lap = sample_u_clamped(u_advected, x + 1, y) + sample_u_clamped(u_advected, x - 1, y) +
 					sample_u_clamped(u_advected, x, y + 1) + sample_u_clamped(u_advected, x, y - 1) - 4.0f * u0;
 			u_tmp[idx] = u0 + dt * (viscosity * lap);
-		}
 	}
 
-	for (int32_t y = 1; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
-			int32_t idx = v_index(x, y);
+	for (int32_t idx : active_v_faces) {
+			const int32_t y = idx / width;
+			const int32_t x = idx - y * width;
+			if (y <= 0 || y >= height) {
+				v_tmp[idx] = 0.0f;
+				continue;
+			}
 			if (!is_liquid_cell(x, y - 1) && !is_liquid_cell(x, y)) {
 				v_tmp[idx] = 0.0f;
 				continue;
@@ -424,40 +707,33 @@ void MacFluidSolver::predict_velocity_explicit() {
 			float lap = sample_v_clamped(v_advected, x + 1, y) + sample_v_clamped(v_advected, x - 1, y) +
 					sample_v_clamped(v_advected, x, y + 1) + sample_v_clamped(v_advected, x, y - 1) - 4.0f * v0;
 			v_tmp[idx] = v0 + dt * (viscosity * lap + gravity);
-		}
 	}
 
-	apply_solid_boundaries(u_tmp, v_tmp);
+	apply_solid_boundaries_active(u_tmp, v_tmp);
 }
 
 void MacFluidSolver::build_pressure_system() {
-	std::fill(rhs.begin(), rhs.end(), 0.0f);
-	std::fill(diag_inv.begin(), diag_inv.end(), 0.0f);
-	std::fill(pressure_active_mask.begin(), pressure_active_mask.end(), 0);
-	std::fill(u_alpha.begin(), u_alpha.end(), 0.0f);
-	std::fill(v_alpha.begin(), v_alpha.end(), 0.0f);
 	active_cells.clear();
 
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
-			int32_t i = cell_index(x, y);
-			world->pressure[i] = 0.0f;
-			if (is_pressure_active_cell(x, y)) {
-				pressure_active_mask[i] = 1;
-				active_cells.push_back(i);
-			}
+	for (int32_t i : active_region_indices) {
+		const int32_t x = i % width;
+		const int32_t y = i / width;
+		world->pressure[i] = 0.0f;
+		if (is_pressure_active_cell(x, y)) {
+			pressure_active_mask[i] = 1;
+			active_cells.push_back(i);
 		}
 	}
 
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x <= width; x++) {
-			u_alpha[u_index(x, y)] = u_face_alpha(x, y);
-		}
+	for (int32_t idx : active_u_faces) {
+		const int32_t y = idx / (width + 1);
+		const int32_t x = idx - y * (width + 1);
+		u_alpha[idx] = u_face_alpha(x, y);
 	}
-	for (int32_t y = 0; y <= height; y++) {
-		for (int32_t x = 0; x < width; x++) {
-			v_alpha[v_index(x, y)] = v_face_alpha(x, y);
-		}
+	for (int32_t idx : active_v_faces) {
+		const int32_t y = idx / width;
+		const int32_t x = idx - y * width;
+		v_alpha[idx] = v_face_alpha(x, y);
 	}
 
 	int32_t write_count = 0;
@@ -483,8 +759,9 @@ void MacFluidSolver::build_pressure_system() {
 			// - internal under-filled cells ask for weak negative divergence,
 			//   pulling volume in.  Free-surface cells do NOT get this underfill
 			//   term, otherwise the surface would constantly suck in water.
-			float excess = std::max(0.0f, world->volume[i] - target_mass);
-			float deficit = std::max(0.0f, target_mass - world->volume[i]);
+			const float pressure_fill_fraction = std::max(world->volume_fraction[i], backtraced_pressure_volume(x, y));
+			float excess = std::max(0.0f, pressure_fill_fraction - target_fill_fraction);
+			float deficit = std::max(0.0f, target_fill_fraction - world->volume_fraction[i]);
 			float s = density_correction_strength * excess / std::max(dt, 1.0e-5f);
 			if (deficit > 0.0f && is_internal_liquid_cell(x, y)) {
 				s -= underfill_correction_strength * deficit / std::max(dt, 1.0e-5f);
@@ -708,12 +985,10 @@ void MacFluidSolver::solve_pressure_pcg() {
 }
 
 void MacFluidSolver::apply_pressure_projection() {
-	u = u_tmp;
-	v = v_tmp;
-
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x <= width; x++) {
-			int32_t idx = u_index(x, y);
+	for (int32_t idx : active_u_faces) {
+			const int32_t y = idx / (width + 1);
+			const int32_t x = idx - y * (width + 1);
+			u[idx] = u_tmp[idx];
 			if (u_face_blocked(x, y)) {
 				u[idx] = 0.0f;
 				continue;
@@ -726,12 +1001,12 @@ void MacFluidSolver::apply_pressure_projection() {
 			float p_left = left_liquid ? world->pressure[cell_index(x - 1, y)] : 0.0f;
 			float p_right = right_liquid ? world->pressure[cell_index(x, y)] : 0.0f;
 			u[idx] -= u_alpha[idx] * (p_right - p_left);
-		}
 	}
 
-	for (int32_t y = 0; y <= height; y++) {
-		for (int32_t x = 0; x < width; x++) {
-			int32_t idx = v_index(x, y);
+	for (int32_t idx : active_v_faces) {
+			const int32_t y = idx / width;
+			const int32_t x = idx - y * width;
+			v[idx] = v_tmp[idx];
 			if (v_face_blocked(x, y)) {
 				v[idx] = 0.0f;
 				continue;
@@ -744,87 +1019,97 @@ void MacFluidSolver::apply_pressure_projection() {
 			float p_up = up_liquid ? world->pressure[cell_index(x, y - 1)] : 0.0f;
 			float p_down = down_liquid ? world->pressure[cell_index(x, y)] : 0.0f;
 			v[idx] -= v_alpha[idx] * (p_down - p_up);
-		}
 	}
 
-	apply_solid_boundaries(u, v);
+	apply_solid_boundaries_active(u, v);
 }
 
 void MacFluidSolver::advect_mass_finite_volume() {
-	std::fill(next_mass.begin(), next_mass.end(), 0.0f);
-	std::fill(next_toxic.begin(), next_toxic.end(), 0.0f);
-	std::fill(next_oil.begin(), next_oil.end(), 0.0f);
-	std::fill(u_mass_flux.begin(), u_mass_flux.end(), 0.0f);
-	std::fill(v_mass_flux.begin(), v_mass_flux.end(), 0.0f);
-	std::fill(outflow_mass.begin(), outflow_mass.end(), 0.0f);
-
 	const int32_t cell_count = width * height;
-	for (int32_t i = 0; i < cell_count; i++) {
-		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume[i]) && world->volume[i] > 0.0f) {
-			next_mass[i] = world->volume[i];
-			next_toxic[i] = clampf(world->toxic[i], 0.0f, world->volume[i]);
-			next_oil[i] = clampf(world->oil[i], 0.0f, world->volume[i]);
+	for (int32_t i : active_region_indices) {
+		next_mass[i] = 0.0f;
+		next_toxic[i] = 0.0f;
+		next_oil[i] = 0.0f;
+		outflow_mass[i] = 0.0f;
+		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > 0.0f) {
+			next_mass[i] = world->volume_fraction[i];
+			next_toxic[i] = clampf(world->toxic[i], 0.0f, world->volume_fraction[i]);
+			next_oil[i] = clampf(world->oil[i], 0.0f, world->volume_fraction[i]);
 		}
 	}
 
 	// First pass: raw volume fluxes and total outgoing volume per donor.
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 1; x < width; x++) {
+	for (int32_t face_idx : active_u_faces) {
+			const int32_t y = face_idx / (width + 1);
+			const int32_t x = face_idx - y * (width + 1);
+			if (x <= 0 || x >= width) {
+				u_mass_flux[face_idx] = 0.0f;
+				continue;
+			}
 			if (u_face_blocked(x, y)) {
 				continue;
 			}
 			const int32_t li = cell_index(x - 1, y);
 			const int32_t ri = cell_index(x, y);
+			if (active_region_mask[li] == 0 || active_region_mask[ri] == 0) {
+				continue;
+			}
 			const float vel = u[u_index(x, y)];
 			float donor_volume = 0.0f;
 			if (vel > 0.0f && get_material_def(world->material[li]).liquid) {
-				donor_volume = std::max(0.0f, world->volume[li]);
+				donor_volume = std::max(0.0f, world->volume_fraction[li]);
 			} else if (vel < 0.0f && get_material_def(world->material[ri]).liquid) {
-				donor_volume = std::max(0.0f, world->volume[ri]);
+				donor_volume = std::max(0.0f, world->volume_fraction[ri]);
 			}
 			float flux = vel * dt * donor_volume;
 			if (!std::isfinite(flux)) {
 				flux = 0.0f;
 			}
-			u_mass_flux[u_index(x, y)] = flux;
+			u_mass_flux[face_idx] = flux;
 			if (flux > 0.0f) {
 				outflow_mass[li] += flux;
 			} else if (flux < 0.0f) {
 				outflow_mass[ri] += -flux;
 			}
-		}
 	}
 
-	for (int32_t y = 1; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
+	for (int32_t face_idx : active_v_faces) {
+			const int32_t y = face_idx / width;
+			const int32_t x = face_idx - y * width;
+			if (y <= 0 || y >= height) {
+				v_mass_flux[face_idx] = 0.0f;
+				continue;
+			}
 			if (v_face_blocked(x, y)) {
 				continue;
 			}
 			const int32_t ui = cell_index(x, y - 1);
 			const int32_t di = cell_index(x, y);
+			if (active_region_mask[ui] == 0 || active_region_mask[di] == 0) {
+				continue;
+			}
 			const float vel = v[v_index(x, y)];
 			float donor_volume = 0.0f;
 			if (vel > 0.0f && get_material_def(world->material[ui]).liquid) {
-				donor_volume = std::max(0.0f, world->volume[ui]);
+				donor_volume = std::max(0.0f, world->volume_fraction[ui]);
 			} else if (vel < 0.0f && get_material_def(world->material[di]).liquid) {
-				donor_volume = std::max(0.0f, world->volume[di]);
+				donor_volume = std::max(0.0f, world->volume_fraction[di]);
 			}
 			float flux = vel * dt * donor_volume;
 			if (!std::isfinite(flux)) {
 				flux = 0.0f;
 			}
-			v_mass_flux[v_index(x, y)] = flux;
+			v_mass_flux[face_idx] = flux;
 			if (flux > 0.0f) {
 				outflow_mass[ui] += flux;
 			} else if (flux < 0.0f) {
 				outflow_mass[di] += -flux;
 			}
-		}
 	}
 
 	auto scale_flux_for_donor = [&](float flux, int32_t donor) -> float {
 		const float raw_out = outflow_mass[donor];
-		const float available = std::max(0.0f, world->volume[donor]);
+		const float available = std::max(0.0f, world->volume_fraction[donor]);
 		if (raw_out > available && raw_out > MASS_EPSILON) {
 			return flux * available / raw_out;
 		}
@@ -832,15 +1117,15 @@ void MacFluidSolver::advect_mass_finite_volume() {
 	};
 
 	auto face_oil_fraction = [&](int32_t donor, int32_t receiver, float scaled_flux_abs) -> float {
-		const float donor_volume = std::max(world->volume[donor], MASS_EPSILON);
+		const float donor_volume = std::max(world->volume_fraction[donor], MASS_EPSILON);
 		const float donor_oil = clampf(world->oil[donor], 0.0f, donor_volume);
 		const float donor_water = std::max(0.0f, donor_volume - donor_oil);
 		const float donor_f = donor_oil / donor_volume;
 
 		float receiver_volume = 0.0f;
 		float receiver_oil = 0.0f;
-		if (receiver >= 0 && receiver < cell_count && get_material_def(world->material[receiver]).liquid && world->volume[receiver] > MASS_EPSILON) {
-			receiver_volume = std::max(0.0f, world->volume[receiver]);
+		if (receiver >= 0 && receiver < cell_count && get_material_def(world->material[receiver]).liquid && world->volume_fraction[receiver] > MASS_EPSILON) {
+			receiver_volume = std::max(0.0f, world->volume_fraction[receiver]);
 			receiver_oil = clampf(world->oil[receiver], 0.0f, receiver_volume);
 		}
 
@@ -869,8 +1154,8 @@ void MacFluidSolver::advect_mass_finite_volume() {
 		const float oil_f = face_oil_fraction(from, to, abs_flux);
 		const float oil_flux = abs_flux * oil_f;
 		float toxic_flux = 0.0f;
-		if (world->volume[from] > MASS_EPSILON) {
-			toxic_flux = abs_flux * clampf(world->toxic[from] / world->volume[from], 0.0f, 1.0f);
+		if (world->volume_fraction[from] > MASS_EPSILON) {
+			toxic_flux = abs_flux * clampf(world->toxic[from] / world->volume_fraction[from], 0.0f, 1.0f);
 		}
 		next_mass[from] -= abs_flux;
 		next_mass[to] += abs_flux;
@@ -882,11 +1167,18 @@ void MacFluidSolver::advect_mass_finite_volume() {
 
 	// Second pass: scale volume fluxes per donor, then split each conserved volume
 	// flux into oil/water components with the local immiscible bias.
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 1; x < width; x++) {
+	for (int32_t face_idx : active_u_faces) {
+			const int32_t y = face_idx / (width + 1);
+			const int32_t x = face_idx - y * (width + 1);
+			if (x <= 0 || x >= width) {
+				continue;
+			}
 			const int32_t li = cell_index(x - 1, y);
 			const int32_t ri = cell_index(x, y);
-			float flux = u_mass_flux[u_index(x, y)];
+			if (active_region_mask[li] == 0 || active_region_mask[ri] == 0) {
+				continue;
+			}
+			float flux = u_mass_flux[face_idx];
 			if (flux > 0.0f) {
 				flux = scale_flux_for_donor(flux, li);
 				apply_signed_flux(li, ri, flux, 0);
@@ -894,14 +1186,20 @@ void MacFluidSolver::advect_mass_finite_volume() {
 				flux = scale_flux_for_donor(flux, ri);
 				apply_signed_flux(ri, li, flux, 0);
 			}
-		}
 	}
 
-	for (int32_t y = 1; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
+	for (int32_t face_idx : active_v_faces) {
+			const int32_t y = face_idx / width;
+			const int32_t x = face_idx - y * width;
+			if (y <= 0 || y >= height) {
+				continue;
+			}
 			const int32_t ui = cell_index(x, y - 1);
 			const int32_t di = cell_index(x, y);
-			float flux = v_mass_flux[v_index(x, y)];
+			if (active_region_mask[ui] == 0 || active_region_mask[di] == 0) {
+				continue;
+			}
+			float flux = v_mass_flux[face_idx];
 			if (flux > 0.0f) {
 				flux = scale_flux_for_donor(flux, ui);
 				apply_signed_flux(ui, di, flux, 1);
@@ -909,42 +1207,45 @@ void MacFluidSolver::advect_mass_finite_volume() {
 				flux = scale_flux_for_donor(flux, di);
 				apply_signed_flux(di, ui, flux, -1);
 			}
-		}
 	}
 
-	for (int32_t i = 0; i < cell_count; i++) {
-		const MaterialDef &def = get_material_def(world->material[i]);
-		if (!std::isfinite(next_mass[i]) || next_mass[i] < MASS_EPSILON) {
-			if (def.liquid) {
-				world->volume[i] = 0.0f;
-				world->density[i] = get_material_def(MATERIAL_AIR).density;
-				world->toxic[i] = 0.0f;
-				world->oil[i] = 0.0f;
-				world->material[i] = MATERIAL_AIR;
+	for (int32_t i : active_region_indices) {
+			const int32_t x = i % width;
+			const int32_t y = i / width;
+			const MaterialDef &def = get_material_def(world->material[i]);
+			if (!std::isfinite(next_mass[i]) || next_mass[i] < MASS_EPSILON) {
+				if (def.liquid) {
+					world->volume_fraction[i] = 0.0f;
+					world->density[i] = get_material_def(MATERIAL_AIR).density;
+					world->toxic[i] = 0.0f;
+					world->oil[i] = 0.0f;
+					world->material[i] = MATERIAL_AIR;
+				}
+			} else if (!def.blocks_velocity) {
+				world->volume_fraction[i] = std::max(0.0f, next_mass[i]);
+				world->oil[i] = clampf(next_oil[i], 0.0f, world->volume_fraction[i]);
+				world->toxic[i] = clampf(next_toxic[i], 0.0f, world->volume_fraction[i]);
+				const float oil_f = oil_fraction_at(i);
+				const float toxic_concentration = world->toxic[i] / std::max(world->volume_fraction[i], MASS_EPSILON);
+				world->density[i] = cell_density(x, y);
+				if (toxic_concentration >= 0.25f && oil_f < 0.50f) {
+					world->material[i] = MATERIAL_TOXIC;
+				} else {
+					world->material[i] = oil_f >= 0.50f ? MATERIAL_OIL : MATERIAL_WATER;
+				}
 			}
-		} else if (!def.blocks_velocity) {
-			world->volume[i] = std::max(0.0f, next_mass[i]);
-			world->oil[i] = clampf(next_oil[i], 0.0f, world->volume[i]);
-			world->toxic[i] = clampf(next_toxic[i], 0.0f, world->volume[i]);
-			const float oil_f = oil_fraction_at(i);
-			const float toxic_concentration = world->toxic[i] / std::max(world->volume[i], MASS_EPSILON);
-			world->density[i] = cell_density(i % width, i / width);
-			if (toxic_concentration >= 0.25f && oil_f < 0.50f) {
-				world->material[i] = MATERIAL_TOXIC;
-			} else {
-				world->material[i] = oil_f >= 0.50f ? MATERIAL_OIL : MATERIAL_WATER;
-			}
-		}
 	}
 }
 void MacFluidSolver::clamp_velocities() {
-	for (float &value : u) {
+	for (int32_t idx : active_u_faces) {
+		float &value = u[idx];
 		value = clampf(value * velocity_damping, -max_velocity, max_velocity);
 	}
-	for (float &value : v) {
+	for (int32_t idx : active_v_faces) {
+		float &value = v[idx];
 		value = clampf(value * velocity_damping, -max_velocity, max_velocity);
 	}
-	apply_solid_boundaries(u, v);
+	apply_solid_boundaries_active(u, v);
 	update_world_velocity_field();
 }
 
@@ -952,32 +1253,125 @@ void MacFluidSolver::update_world_velocity_field() {
 	if (world == nullptr) {
 		return;
 	}
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
-			const int32_t i = cell_index(x, y);
-			world->velocity_x[i] = 0.5f * (u[u_index(x, y)] + u[u_index(x + 1, y)]);
-			world->velocity_y[i] = 0.5f * (v[v_index(x, y)] + v[v_index(x, y + 1)]);
-		}
+	for (int32_t i : active_region_indices) {
+		const int32_t x = i % width;
+		const int32_t y = i / width;
+		world->velocity_x[i] = 0.5f * (u[u_index(x, y)] + u[u_index(x + 1, y)]);
+		world->velocity_y[i] = 0.5f * (v[v_index(x, y)] + v[v_index(x, y + 1)]);
 	}
 }
 
 void MacFluidSolver::step() {
+	begin_step_job();
+	while (has_pending_step_job()) {
+		advance_step_job(1000000.0);
+	}
+}
+
+void MacFluidSolver::begin_step_job() {
 	if (world == nullptr) {
 		return;
 	}
-	if (world->volume.empty()) {
+	if (step_job_active) {
+		return;
+	}
+	if (world->volume_fraction.empty()) {
 		set_world_size(width, height);
 	}
-	auto t0 = std::chrono::high_resolution_clock::now();
-	predict_velocity_explicit();
-	build_pressure_system();
-	solve_pressure_pcg();
-	apply_pressure_projection();
-	advect_mass_finite_volume();
-	clamp_velocities();
-	step_count++;
-	auto t1 = std::chrono::high_resolution_clock::now();
-	last_step_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+	step_job_start_time = std::chrono::high_resolution_clock::now();
+	last_predict_ms = 0.0;
+	last_build_ms = 0.0;
+	last_pcg_ms = 0.0;
+	last_project_ms = 0.0;
+	last_advect_ms = 0.0;
+	last_clamp_ms = 0.0;
+	last_pcg_iterations = 0;
+	last_pcg_residual = 0.0;
+
+	if (!compute_active_liquid_region()) {
+		if (had_active_liquid_last_step) {
+			std::fill(u.begin(), u.end(), 0.0f);
+			std::fill(v.begin(), v.end(), 0.0f);
+			std::fill(u_tmp.begin(), u_tmp.end(), 0.0f);
+			std::fill(v_tmp.begin(), v_tmp.end(), 0.0f);
+			std::fill(u_advected.begin(), u_advected.end(), 0.0f);
+			std::fill(v_advected.begin(), v_advected.end(), 0.0f);
+			std::fill(world->velocity_x.begin(), world->velocity_x.end(), 0.0f);
+			std::fill(world->velocity_y.begin(), world->velocity_y.end(), 0.0f);
+		}
+		active_cells.clear();
+		pressure_rows.clear();
+		had_active_liquid_last_step = false;
+		step_count++;
+		auto t1 = std::chrono::high_resolution_clock::now();
+		last_step_ms = elapsed_ms(step_job_start_time, t1);
+		step_phase = StepPhase::IDLE;
+		step_job_active = false;
+		return;
+	}
+
+	step_phase = StepPhase::PREDICT;
+	step_job_active = true;
+}
+
+bool MacFluidSolver::advance_step_job(double p_budget_ms) {
+	if (!step_job_active) {
+		return true;
+	}
+	const auto budget_start = std::chrono::high_resolution_clock::now();
+	const double budget_ms = std::max(0.0, p_budget_ms);
+	while (step_job_active) {
+		const auto phase_start = std::chrono::high_resolution_clock::now();
+		switch (step_phase) {
+			case StepPhase::PREDICT:
+				predict_velocity_explicit();
+				last_predict_ms += elapsed_ms(phase_start, std::chrono::high_resolution_clock::now());
+				step_phase = StepPhase::BUILD;
+				break;
+			case StepPhase::BUILD:
+				build_pressure_system();
+				last_build_ms += elapsed_ms(phase_start, std::chrono::high_resolution_clock::now());
+				step_phase = StepPhase::PCG;
+				break;
+			case StepPhase::PCG:
+				solve_pressure_pcg();
+				last_pcg_ms += elapsed_ms(phase_start, std::chrono::high_resolution_clock::now());
+				step_phase = StepPhase::PROJECT;
+				break;
+			case StepPhase::PROJECT:
+				apply_pressure_projection();
+				last_project_ms += elapsed_ms(phase_start, std::chrono::high_resolution_clock::now());
+				step_phase = StepPhase::ADVECT;
+				break;
+			case StepPhase::ADVECT:
+				advect_mass_finite_volume();
+				last_advect_ms += elapsed_ms(phase_start, std::chrono::high_resolution_clock::now());
+				step_phase = StepPhase::CLAMP;
+				break;
+			case StepPhase::CLAMP:
+				clamp_velocities();
+				last_clamp_ms += elapsed_ms(phase_start, std::chrono::high_resolution_clock::now());
+				had_active_liquid_last_step = true;
+				step_count++;
+				last_step_ms = elapsed_ms(step_job_start_time, std::chrono::high_resolution_clock::now());
+				step_phase = StepPhase::IDLE;
+				step_job_active = false;
+				return true;
+			case StepPhase::IDLE:
+			default:
+				step_job_active = false;
+				return true;
+		}
+		const auto now = std::chrono::high_resolution_clock::now();
+		if (elapsed_ms(budget_start, now) >= budget_ms) {
+			break;
+		}
+	}
+	return !step_job_active;
+}
+
+bool MacFluidSolver::has_pending_step_job() const {
+	return step_job_active;
 }
 
 void MacFluidSolver::set_world_size(int32_t p_width, int32_t p_height) {
@@ -996,9 +1390,9 @@ void MacFluidSolver::set_world_size(int32_t p_width, int32_t p_height) {
 
 int32_t MacFluidSolver::get_width() const { return width; }
 int32_t MacFluidSolver::get_height() const { return height; }
-void MacFluidSolver::set_dt(double p_dt) { dt = clampf(static_cast<float>(p_dt), 0.01f, 1.0f); }
+void MacFluidSolver::set_dt(double p_dt) { dt = clampf(static_cast<float>(p_dt), 1.0f / 240.0f, 0.25f); }
 double MacFluidSolver::get_dt() const { return dt; }
-void MacFluidSolver::set_gravity(double p_gravity) { gravity = clampf(static_cast<float>(p_gravity), -10.0f, 10.0f); }
+void MacFluidSolver::set_gravity(double p_gravity) { gravity = clampf(static_cast<float>(p_gravity), -1000.0f, 1000.0f); }
 double MacFluidSolver::get_gravity() const { return gravity; }
 void MacFluidSolver::set_viscosity(double p_viscosity) { viscosity = clampf(static_cast<float>(p_viscosity), 0.0f, 1.0f); }
 double MacFluidSolver::get_viscosity() const { return viscosity; }
@@ -1017,7 +1411,7 @@ void MacFluidSolver::make_rock(int32_t p_x, int32_t p_y) {
 	}
 	int32_t i = cell_index(p_x, p_y);
 	world->material[i] = MATERIAL_ROCK;
-	world->volume[i] = 0.0f;
+	world->volume_fraction[i] = 0.0f;
 	world->density[i] = get_material_def(MATERIAL_ROCK).density;
 	world->toxic[i] = 0.0f;
 	world->oil[i] = 0.0f;
@@ -1030,7 +1424,7 @@ void MacFluidSolver::make_air(int32_t p_x, int32_t p_y) {
 	}
 	int32_t i = cell_index(p_x, p_y);
 	world->material[i] = MATERIAL_AIR;
-	world->volume[i] = 0.0f;
+	world->volume_fraction[i] = 0.0f;
 	world->density[i] = get_material_def(MATERIAL_AIR).density;
 	world->toxic[i] = 0.0f;
 	world->oil[i] = 0.0f;
@@ -1046,9 +1440,9 @@ void MacFluidSolver::make_water(int32_t p_x, int32_t p_y, float p_mass) {
 		world->toxic[i] = 0.0f;
 		world->oil[i] = 0.0f;
 	}
-	world->volume[i] = clampf(world->volume[i] + p_mass, 0.0f, 1.0f);
-	world->oil[i] = clampf(world->oil[i], 0.0f, world->volume[i]);
-	world->toxic[i] = clampf(world->toxic[i], 0.0f, world->volume[i]);
+	world->volume_fraction[i] = clampf(world->volume_fraction[i] + p_mass, 0.0f, 1.0f);
+	world->oil[i] = clampf(world->oil[i], 0.0f, world->volume_fraction[i]);
+	world->toxic[i] = clampf(world->toxic[i], 0.0f, world->volume_fraction[i]);
 	const float oil_f = oil_fraction_at(i);
 	world->density[i] = get_material_def(MATERIAL_WATER).density * (1.0f - oil_f) + get_material_def(MATERIAL_OIL).density * oil_f;
 	world->material[i] = oil_f >= 0.50f ? MATERIAL_OIL : MATERIAL_WATER;
@@ -1060,14 +1454,14 @@ void MacFluidSolver::make_oil(int32_t p_x, int32_t p_y, float p_mass) {
 	}
 	int32_t i = cell_index(p_x, p_y);
 	if (!get_material_def(world->material[i]).liquid) {
-		world->volume[i] = 0.0f;
+		world->volume_fraction[i] = 0.0f;
 		world->toxic[i] = 0.0f;
 		world->oil[i] = 0.0f;
 	}
 	const float add_volume = clampf(p_mass, 0.0f, 1.0f);
-	world->volume[i] = clampf(world->volume[i] + add_volume, 0.0f, 1.0f);
-	world->oil[i] = clampf(world->oil[i] + add_volume, 0.0f, world->volume[i]);
-	world->toxic[i] = clampf(world->toxic[i], 0.0f, world->volume[i]);
+	world->volume_fraction[i] = clampf(world->volume_fraction[i] + add_volume, 0.0f, 1.0f);
+	world->oil[i] = clampf(world->oil[i] + add_volume, 0.0f, world->volume_fraction[i]);
+	world->toxic[i] = clampf(world->toxic[i], 0.0f, world->volume_fraction[i]);
 	const float oil_f = oil_fraction_at(i);
 	world->density[i] = get_material_def(MATERIAL_WATER).density * (1.0f - oil_f) + get_material_def(MATERIAL_OIL).density * oil_f;
 	world->material[i] = oil_f >= 0.50f ? MATERIAL_OIL : MATERIAL_WATER;
@@ -1170,9 +1564,9 @@ void MacFluidSolver::inject_water(double p_x, double p_y, double p_radius, doubl
 				world->toxic[i] = 0.0f;
 				world->oil[i] = 0.0f;
 			}
-			world->volume[i] = clampf(world->volume[i] + add_mass, 0.0f, 1.0f);
-			world->oil[i] = clampf(world->oil[i], 0.0f, world->volume[i]);
-			world->toxic[i] = clampf(world->toxic[i], 0.0f, world->volume[i]);
+			world->volume_fraction[i] = clampf(world->volume_fraction[i] + add_mass, 0.0f, 1.0f);
+			world->oil[i] = clampf(world->oil[i], 0.0f, world->volume_fraction[i]);
+			world->toxic[i] = clampf(world->toxic[i], 0.0f, world->volume_fraction[i]);
 			const float oil_f = oil_fraction_at(i);
 			world->density[i] = get_material_def(MATERIAL_WATER).density * (1.0f - oil_f) + get_material_def(MATERIAL_OIL).density * oil_f;
 			world->material[i] = oil_f >= 0.50f ? MATERIAL_OIL : MATERIAL_WATER;
@@ -1229,13 +1623,13 @@ void MacFluidSolver::fill_rgba_pixels(std::vector<uint8_t> &p_pixels) const {
 				r = static_cast<uint8_t>(255.0f * flicker);
 				g = static_cast<uint8_t>((92.0f + 120.0f * (1.0f - age)) * flicker);
 				b = static_cast<uint8_t>(18.0f + 30.0f * (1.0f - age));
-			} else if (def.gas && std::isfinite(world->volume[i]) && world->volume[i] > MASS_EPSILON) {
-				float m = clampf(world->volume[i], 0.0f, 1.5f);
+			} else if (def.gas && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > MASS_EPSILON) {
+				float m = clampf(world->volume_fraction[i], 0.0f, 1.5f);
 				float age = clampf(world->lifetime[i] / 1400.0f, 0.0f, 1.0f);
-				float left = (x > 0 && get_material_def(world->material[i - 1]).gas) ? world->volume[i - 1] : 0.0f;
-				float right = (x + 1 < width && get_material_def(world->material[i + 1]).gas) ? world->volume[i + 1] : 0.0f;
-				float up = (y > 0 && get_material_def(world->material[i - width]).gas) ? world->volume[i - width] : 0.0f;
-				float down = (y + 1 < height && get_material_def(world->material[i + width]).gas) ? world->volume[i + width] : 0.0f;
+				float left = (x > 0 && get_material_def(world->material[i - 1]).gas) ? world->volume_fraction[i - 1] : 0.0f;
+				float right = (x + 1 < width && get_material_def(world->material[i + 1]).gas) ? world->volume_fraction[i + 1] : 0.0f;
+				float up = (y > 0 && get_material_def(world->material[i - width]).gas) ? world->volume_fraction[i - width] : 0.0f;
+				float down = (y + 1 < height && get_material_def(world->material[i + width]).gas) ? world->volume_fraction[i + width] : 0.0f;
 				float neighbor_avg = 0.25f * (left + right + up + down);
 				float edge = clampf(std::abs(m - neighbor_avg) * 1.4f, 0.0f, 1.0f);
 				float n1 = hash01(x, y, static_cast<int32_t>(world->lifetime[i]) / 7);
@@ -1263,10 +1657,10 @@ void MacFluidSolver::fill_rgba_pixels(std::vector<uint8_t> &p_pixels) const {
 				r = static_cast<uint8_t>(5.0f * (1.0f - visual) + gas_r * visual);
 				g = static_cast<uint8_t>(6.0f * (1.0f - visual) + gas_g * visual);
 				b = static_cast<uint8_t>(9.0f * (1.0f - visual) + gas_b * visual);
-			} else if (def.liquid && std::isfinite(world->volume[i]) && world->volume[i] > MASS_EPSILON) {
-				float depth = clampf(world->volume[i] / DEEPEST_COLOR_THRESHOLD, 0.0f, 1.0f);
+			} else if (def.liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > MASS_EPSILON) {
+				float depth = clampf(world->volume_fraction[i] / DEEPEST_COLOR_THRESHOLD, 0.0f, 1.0f);
 				float pvis = clampf(std::abs(world->pressure[i]) * 0.04f, 0.0f, 0.45f);
-				float toxic_concentration = clampf(world->toxic[i] / std::max(world->volume[i], MASS_EPSILON), 0.0f, 1.0f);
+				float toxic_concentration = clampf(world->toxic[i] / std::max(world->volume_fraction[i], MASS_EPSILON), 0.0f, 1.0f);
 				float toxic_visible = clampf((toxic_concentration - 0.25f) / 0.75f, 0.0f, 1.0f);
 				float oil_visible = oil_fraction_at(i);
 				float water_r = 10.0f + 45.0f * pvis;
@@ -1296,8 +1690,8 @@ void MacFluidSolver::fill_rgba_pixels(std::vector<uint8_t> &p_pixels) const {
 double MacFluidSolver::get_total_water_mass() const {
 	double total = 0.0;
 	for (int32_t i = 0; i < width * height; i++) {
-		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume[i]) && world->volume[i] > 0.0f) {
-			total += world->volume[i];
+		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > 0.0f) {
+			total += world->volume_fraction[i];
 		}
 	}
 	return total;
@@ -1306,7 +1700,7 @@ double MacFluidSolver::get_total_water_mass() const {
 int64_t MacFluidSolver::get_water_cell_count() const {
 	int64_t count = 0;
 	for (int32_t i = 0; i < width * height; i++) {
-		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume[i]) && world->volume[i] > MASS_EPSILON) {
+		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > MASS_EPSILON) {
 			count++;
 		}
 	}
@@ -1317,8 +1711,8 @@ double MacFluidSolver::get_average_water_mass() const {
 	double total = 0.0;
 	int64_t count = 0;
 	for (int32_t i = 0; i < width * height; i++) {
-		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume[i]) && world->volume[i] > MASS_EPSILON) {
-			total += world->volume[i];
+		if (get_material_def(world->material[i]).liquid && std::isfinite(world->volume_fraction[i]) && world->volume_fraction[i] > MASS_EPSILON) {
+			total += world->volume_fraction[i];
 			count++;
 		}
 	}
@@ -1326,9 +1720,23 @@ double MacFluidSolver::get_average_water_mass() const {
 }
 
 double MacFluidSolver::get_last_step_ms() const { return last_step_ms; }
+double MacFluidSolver::get_last_predict_ms() const { return last_predict_ms; }
+double MacFluidSolver::get_last_build_ms() const { return last_build_ms; }
+double MacFluidSolver::get_last_pcg_ms() const { return last_pcg_ms; }
+double MacFluidSolver::get_last_project_ms() const { return last_project_ms; }
+double MacFluidSolver::get_last_advect_ms() const { return last_advect_ms; }
+double MacFluidSolver::get_last_clamp_ms() const { return last_clamp_ms; }
+int32_t MacFluidSolver::get_active_region_min_x() const { return active_min_x; }
+int32_t MacFluidSolver::get_active_region_min_y() const { return active_min_y; }
+int32_t MacFluidSolver::get_active_region_max_x() const { return active_max_x; }
+int32_t MacFluidSolver::get_active_region_max_y() const { return active_max_y; }
+int32_t MacFluidSolver::get_active_region_pad() const { return active_pad; }
+double MacFluidSolver::get_active_region_max_speed() const { return active_max_speed; }
 int64_t MacFluidSolver::get_step_count() const { return static_cast<int64_t>(step_count); }
 int32_t MacFluidSolver::get_last_pcg_iterations() const { return last_pcg_iterations; }
 double MacFluidSolver::get_last_pcg_residual() const { return last_pcg_residual; }
+
+
 
 
 

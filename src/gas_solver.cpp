@@ -1,4 +1,4 @@
-﻿#include "gas_solver.h"
+#include "gas_solver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -48,7 +48,7 @@ bool GasSolver::can_rise_into(const WorldGrid &p_grid, int32_t p_from, int32_t p
 	// Gas rises only into a lower-concentration gas cell. If the cell above is
 	// equally dense or denser, rising is blocked and the source can only diffuse
 	// sideways/down this frame. This prevents unlimited vertical over-stacking.
-	return p_grid.volume[to] + 0.002f < p_grid.volume[p_from];
+	return p_grid.volume_fraction[to] + 0.002f < p_grid.volume_fraction[p_from];
 }
 
 bool GasSolver::dissolve_toxic_gas_into_liquid(WorldGrid &p_grid, int32_t p_x, int32_t p_y) {
@@ -62,8 +62,8 @@ bool GasSolver::dissolve_toxic_gas_into_liquid(WorldGrid &p_grid, int32_t p_x, i
 			continue;
 		}
 		const int32_t li = p_grid.cell_index(x, y);
-		p_grid.toxic[li] = clampf(p_grid.toxic[li] + 0.06f, 0.0f, std::max(p_grid.volume[li], 0.15f));
-		if (p_grid.toxic[li] / std::max(p_grid.volume[li], 0.01f) > 0.25f) {
+		p_grid.toxic[li] = clampf(p_grid.toxic[li] + 0.06f, 0.0f, std::max(p_grid.volume_fraction[li], 0.15f));
+		if (p_grid.toxic[li] / std::max(p_grid.volume_fraction[li], 0.01f) > 0.25f) {
 			p_grid.material[li] = MATERIAL_TOXIC;
 		}
 		return true;
@@ -103,7 +103,7 @@ void GasSolver::add_gas_mass(WorldGrid &p_grid, int32_t p_to_x, int32_t p_to_y, 
 	}
 	const int32_t to = p_grid.cell_index(p_to_x, p_to_y);
 	if (get_material_def(p_grid.material[to]).gas) {
-		const float old_mass = std::max(0.0f, p_grid.volume[to]);
+		const float old_mass = std::max(0.0f, p_grid.volume_fraction[to]);
 		const float new_mass = old_mass + p_amount;
 		if (new_mass <= 0.0f) {
 			return;
@@ -117,12 +117,12 @@ void GasSolver::add_gas_mass(WorldGrid &p_grid, int32_t p_to_x, int32_t p_to_y, 
 		p_grid.velocity_y[to] = clampf((p_grid.velocity_y[to] * old_mass + p_vy * p_amount) / new_mass, -max_velocity, max_velocity);
 		p_grid.lifetime[to] = (p_grid.lifetime[to] * old_mass + p_lifetime * p_amount) / new_mass;
 		p_grid.temperature[to] = std::max(p_grid.temperature[to], p_temperature);
-		p_grid.volume[to] = new_mass;
+		p_grid.volume_fraction[to] = new_mass;
 		return;
 	}
 
 	p_grid.material[to] = p_material;
-	p_grid.volume[to] = p_amount;
+	p_grid.volume_fraction[to] = p_amount;
 	p_grid.density[to] = get_material_def(p_material).density;
 	p_grid.toxic[to] = p_material == MATERIAL_TOXIC_GAS ? p_amount : 0.0f;
 	p_grid.oil[to] = 0.0f;
@@ -172,7 +172,7 @@ void GasSolver::step(WorldGrid &p_grid) {
 		p_grid.temperature[idx] = std::max(0.0f, p_grid.temperature[idx] - 0.004f);
 
 		if (mat == MATERIAL_STEAM && p_grid.temperature[idx] < 0.22f) {
-			p_grid.make_water(x, y, std::max(0.15f, p_grid.volume[idx]));
+			p_grid.make_water(x, y, std::max(0.15f, p_grid.volume_fraction[idx]));
 			continue;
 		}
 		if (mat == MATERIAL_TOXIC_GAS && dissolve_toxic_gas_into_liquid(p_grid, x, y)) {
@@ -184,7 +184,7 @@ void GasSolver::step(WorldGrid &p_grid) {
 			continue;
 		}
 
-		float source_mass = std::max(0.0f, p_grid.volume[idx]);
+		float source_mass = std::max(0.0f, p_grid.volume_fraction[idx]);
 		const float effective_max_life = gas_max_lifetime(mat) * (0.45f + 0.55f * clampf(source_mass, 0.0f, 1.0f));
 		if (source_mass < min_mass || p_grid.lifetime[idx] > effective_max_life) {
 			p_grid.make_air(x, y);
@@ -229,9 +229,10 @@ void GasSolver::step(WorldGrid &p_grid) {
 		if (remaining < min_mass || p_grid.lifetime[idx] > gas_max_lifetime(mat) * (0.45f + 0.55f * clampf(remaining, 0.0f, 1.0f))) {
 			p_grid.make_air(x, y);
 		} else {
-			p_grid.volume[idx] = remaining;
+			p_grid.volume_fraction[idx] = remaining;
 			p_grid.velocity_x[idx] = vx * 0.35f;
 			p_grid.velocity_y[idx] = vy * 0.35f;
 		}
 	}
 }
+

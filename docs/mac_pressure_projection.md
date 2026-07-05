@@ -3041,3 +3041,613 @@ but now the velocity field itself is also transported by the flow.
 This should preserve horizontal momentum much better for water guns, parabolic jets, and falling streams. It is the stable numerical form of the convective term `(u · ∇)u`.
 
 Note: semi-Lagrangian advection is intentionally dissipative. It is stable, but it can blur/decay velocity over time. If stronger momentum preservation is needed later, the next step is BFECC/MacCormack velocity advection or finite-volume momentum advection.
+
+### Active liquid region, early-out, and fluid phase timings
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_simulation.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+```
+
+Problem fixed: when there is no liquid, the fluid solver used to still execute most passes over the full grid. Now each `MacFluidSolver::step()` first computes a liquid effective region:
+
+```text
+scan cells once:
+  if material is liquid and volume > epsilon and not covered by rigid body:
+    update liquid bounding box
+    update max cell-centered speed from MAC u/v
+
+pad = ceil(max_speed * dt * 1.5) + 3, at least 3 cells
+active rect = liquid bounds expanded by pad and clamped to the world
+active_region_mask[i] = true inside that rect
+```
+
+The solver keeps both:
+
+```text
+active_region_mask[i]  // full-cell boolean table for O(1) effective-region queries
+active_min/max x/y     // loop bounds, so passes do not sweep the whole grid
+```
+
+Important distinction:
+
+```text
+active_region_mask = fluid work region for this frame
+active_cells       = pressure-matrix nonzero rows for PCG
+```
+
+`active_cells` is still kept because PCG dot products and stencil SpMV should only iterate the pressure-active rows. It is not used as the general fluid-region representation.
+
+Early-out behavior:
+
+```text
+if no liquid is found:
+  skip predict/build/PCG/project/advect/clamp
+  clear stale velocity fields once when transitioning from liquid -> no liquid
+  report all fluid phase timings as 0.00 ms
+```
+
+Region-narrowed passes:
+
+```text
+predict_velocity_explicit()      // u/v semi-Lagrangian advection + viscosity/gravity only on active face ranges
+build_pressure_system()          // pressure mask, alpha, rhs, stencil rows only inside active rect
+apply_pressure_projection()      // pressure gradient only on active face ranges
+advect_mass_finite_volume()      // next volume/oil/toxic, fluxes, outflow, writeback only inside active rect
+clamp_velocities()               // damping/clamp and world velocity update only inside active rect
+```
+
+The padding uses `1.5 * max_speed * dt` so the region includes cells that liquid can plausibly reach in one step. This is still a rectangle, not a sparse cell list, so it is simple and cache-friendly. Later, chunk activation can replace the one full scan with dirty/active chunks.
+
+Timing instrumentation added:
+
+```text
+get_last_predict_ms()
+get_last_build_ms()
+get_last_pcg_ms()
+get_last_project_ms()
+get_last_advect_ms()
+get_last_clamp_ms()
+get_last_step_ms()
+```
+
+Godot UI now prints all these values with two decimals:
+
+```text
+fluid phases: predict | build | pcg | project | advect | clamp | total
+```
+
+The UI also prints the active fluid rectangle, padding, and max speed. This is intended to decide later whether expensive fluid phases should be scheduled across multiple rendered frames. The current implementation does not yet split pressure/decompression over a 0.05s cadence; it only exposes the per-phase timings needed to do that safely without changing the physical stepping blindly.
+
+### Backtraced pressure-active threshold after velocity advection
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.cpp
+```
+
+Issue: after adding semi-Lagrangian velocity advection, the velocity field is transported before pressure projection, but `volume` is still advected later by `advect_mass_finite_volume()`. If pressure activity only tests the current cell volume,
+
+```text
+volume^n(x) > pressure_active_mass
+```
+
+then a fast horizontal stream can be time-layer shifted: velocity already says liquid is arriving at `x`, while the current volume at `x` is still below threshold. The pressure solve then misses that destination cell for one step.
+
+Fix: pressure activity now uses an OR gate:
+
+```text
+current_active = current cell is pressure-solved and volume^n(x) > threshold
+source_active  = volume^n(x - dt * u_tmp_cell(x)) > threshold
+pressure_active = current_active OR source_active OR internal_liquid_current
+```
+
+The source sample is a cell-centered bilinear sample of pressure-solved liquid volume. Samples outside the grid, inside solids, or inside rigid-body-covered cells contribute zero.
+
+Density consistency: if an air/low-volume destination cell becomes pressure-active only because its backtraced source contains liquid, `cell_density()` uses liquid density instead of air density. This prevents
+
+```text
+alpha = dt / rho_air
+```
+
+from becoming too large and creating an over-strong projection impulse at incoming fronts.
+
+Volume correction consistency: the over-compression source term now uses
+
+```text
+pressure_volume = max(current_volume, backtraced_source_volume)
+s = density_correction_strength * max(pressure_volume - target_mass, 0) / dt
+```
+
+while the internal underfill term still uses current cell volume and still requires `is_internal_liquid_cell()`. This avoids making free-surface destination cells artificially suck liquid inward.
+
+Important dt note: the backtrace displacement currently uses the same solver `dt` as velocity advection:
+
+```text
+source = cell_center - dt * u_tmp_cell
+```
+
+If pressure/decompression is later split onto a separate 0.05s cadence or substep, this backtrace must use that projection/advection substep's effective dt rather than wall-clock frame time.
+
+### Sparse active fluid indices for advection and pressure passes
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.cpp
+```
+
+The first active-region optimization used a padded bounding rectangle. That fixed full-grid passes, but it was still too coarse when liquid was sparse or split into several disconnected blobs: advection and velocity passes still visited every cell inside the rectangle, including large air gaps.
+
+The fluid solver now uses a dual representation:
+
+```cpp
+active_region_mask[i]       // O(1) membership query for cells
+active_region_indices[]     // compact traversal list for cells
+u_active_face_mask[idx]     // O(1) membership query for u faces
+v_active_face_mask[idx]     // O(1) membership query for v faces
+active_u_faces[]            // compact traversal list for u faces
+active_v_faces[]            // compact traversal list for v faces
+```
+
+Construction per fluid step:
+
+```text
+1. Clear previous masks by iterating previous indices, not by full-grid fill.
+2. Scan material/volume once to find liquid source cells and max speed.
+3. pad = ceil(max_speed * dt * 1.5) + 3, minimum 3.
+4. For every liquid source cell, mark all cells in its local padded square.
+5. When a cell is first marked, push it into active_region_indices.
+6. For every active cell, mark its two adjacent u faces and two adjacent v faces.
+7. When a face is first marked, push it into active_u_faces / active_v_faces.
+```
+
+This keeps both advantages:
+
+```text
+mask    -> fast random query: should this cell/face participate?
+indices -> fast traversal: only visit active sparse cells/faces, not the whole padded rectangle
+```
+
+Passes changed to use indices instead of the coarse rectangle:
+
+```text
+predict_velocity_explicit()      -> active_u_faces / active_v_faces
+build_pressure_system()          -> active_region_indices + active face lists
+apply_pressure_projection()      -> active_u_faces / active_v_faces
+advect_mass_finite_volume()      -> active_region_indices + active face lists
+clamp_velocities()               -> active_u_faces / active_v_faces
+update_world_velocity_field()    -> active_region_indices
+```
+
+Advection now also uses the cell mask as a safety gate on each face:
+
+```text
+for a u face between left/right cells:
+  skip if left or right is outside active_region_mask
+
+for a v face between up/down cells:
+  skip if up or down is outside active_region_mask
+```
+
+Because the active region is already expanded by the maximum one-step travel distance, skipping flux beyond the mask should not remove reachable flow; it prevents stale, uninitialized `next_mass/outflow` cells from being touched outside the sparse region.
+
+Pressure solve still keeps a separate list:
+
+```cpp
+active_cells[]
+```
+
+This is not the general fluid active list. It is the compact list of nonzero rows in the pressure matrix used by PCG dot products and stencil SpMV.
+
+Current remaining full-grid cost: finding liquid source cells still scans all cells once per fluid step. This is the next candidate for chunk-level optimization: maintain dirty/active chunks or a world-level liquid count/list so zero-liquid and sparse-liquid scenes can skip even that scan.
+
+### 30 Hz fluid dt and budgeted phase scheduler
+
+Implemented in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_fluid_solver.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_simulation.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+```
+
+The fluid timestep is now treated as real seconds instead of an arbitrary tick scale:
+
+```text
+default dt = 1 / 30 s
+gravity unit = cells / s^2
+velocity unit = cells / s
+```
+
+Default tuning changed accordingly:
+
+```text
+dt      = 1/30
+gravity = 120 cells/s^2
+max_velocity clamp = 30 cells/s
+```
+
+`MacWorld::_process()` now uses `sim.get_dt()` as the target fluid interval:
+
+```text
+target_fluid_interval = fluid dt
+fluid_budget_ms = 5.0 ms per rendered frame
+```
+
+Frame scheduling:
+
+```text
+fluid_accumulator += frame_delta * simulation_speed
+
+while this frame's fluid work time < 5 ms:
+  if no pending budgeted simulation step:
+    if accumulator < dt: stop
+    begin_budgeted_step()
+    accumulator -= dt
+
+  advance_budgeted_step(remaining_budget_ms)
+
+  if the step completes:
+    count one completed sim step and allow another if budget remains
+  else:
+    stop and continue this same pending step next rendered frame
+```
+
+The fluid solver itself is now a small phase job state machine:
+
+```text
+PREDICT -> BUILD -> PCG -> PROJECT -> ADVECT -> CLAMP -> done
+```
+
+Each call to `advance_step_job(budget_ms)` executes phases in order until the budget is consumed or the job completes. A phase is not interrupted halfway; if one phase costs more than the remaining budget, it may slightly overshoot for that frame. This keeps the implementation simple and avoids exposing half-finished inner loops.
+
+`MacSimulation` wraps the budgeted fluid job with the existing material order:
+
+```text
+begin_budgeted_step():
+  rigid_solver.step(grid)
+  powder_solver.step(grid) if needed
+  fluid_solver.begin_step_job()
+
+when fluid job completes:
+  resolve fluid/powder pressure interaction
+  gas_solver.step(grid) if needed
+  fire_solver.step(grid) if needed
+  reaction_solver.step(grid)
+```
+
+So a simulation step can span multiple rendered frames, but post-fluid solvers only run after the fluid phase has completed. The texture is updated only after a complete simulation step, not after every partial fluid phase, to avoid rendering intermediate pressure/advection states.
+
+The UI now displays:
+
+```text
+target fluid: 30.0 steps/s
+budget: 5.00 ms/frame
+```
+
+and the `dt` slider label reports both seconds and Hz.
+
+Future refinement: split PCG into iteration batches if `pcg` alone becomes larger than the 5 ms frame budget. The current scheduler splits by major phase only.
+
+### Budgeted fluid job: responsive post-solver timing
+
+Updated in:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_simulation.cpp
+```
+
+The first budgeted scheduler version waited for the fluid job to fully finish before running post-fluid systems:
+
+```text
+fluid complete -> fluid/powder interaction -> gas -> fire -> reaction
+```
+
+This minimized half-step reads, but it also delayed material interaction when a fluid step was split across rendered frames.
+
+The timing is now changed for responsiveness:
+
+```text
+begin_budgeted_step():
+  rigid_solver.step(grid)
+  powder_solver.step(grid) if needed
+  fluid_solver.begin_step_job()
+  resolve_fluid_powder_interactions()
+  gas_solver.step(grid) if needed
+  fire_solver.step(grid) if needed
+  reaction_solver.step(grid)
+
+later rendered frames:
+  fluid_solver.advance_step_job(remaining_budget)
+  when fluid completes, only mark the budgeted step complete
+```
+
+Meaning: post-fluid systems run once per 30 Hz simulation tick immediately. If the budgeted fluid job is still pending, they read the last committed fluid state. If there is no liquid or the fluid job is already complete, they read the updated state. This trades a small amount of temporal lag in fluid/material coupling for faster interaction response and avoids stalling gas/fire/reaction behind a multi-frame fluid solve.
+
+The fluid solver still does not expose partially computed pressure/advection buffers as committed volume; material systems see a coherent `WorldGrid`, either from the previous completed fluid step or from a just-completed one.
+
+
+### Fluid frame budget adjusted to 4 ms
+
+Updated in:
+
+`	ext
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.h
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+` 
+
+The budgeted fluid scheduler now uses:
+
+`	ext
+fluid_budget_ms = 4.0 ms per rendered frame
+` 
+
+This leaves more room for Godot rendering, rigid bodies, texture upload, UI, and other material solvers while still allowing multi-frame fluid phase jobs to progress incrementally.
+
+
+### Debug slider panel moved to lower-left
+
+Updated in:
+
+`	ext
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+` 
+
+The parameter slider panel is now positioned near the lower-left of the viewport and reduced from 470/440 px wide to 340/320 px so it blocks less of the left-side debug text and simulation view.
+
+
+### Debug slider panel raised to avoid bottom clipping
+
+Updated in:
+
+`	ext
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+` 
+
+The lower-left parameter panel was too close to the bottom and could be partially clipped. Its y position now uses iewport_height - 430 instead of iewport_height - 285, and the panel/slider widths were reduced to 310/290 px.
+
+## 13. 2026-07-05：fill fraction 语义、RHS 修正与刚体挤液解耦
+
+### 13.1 `volume_fraction` 不是物理质量
+
+当前世界格子的液体标量字段命名为：
+
+```txt
+WorldGrid::volume_fraction
+```
+
+它表示一个 cell 的填充率 / 占有率，而不是物理质量。NS/MAC 求解中的速度 `u,v` 也不是“质量速度”，而是以 `cells / s` 为单位的体积流动速度；有限体积 advection 搬运的是填充体积。不同液体的密度通过 `WorldGrid::density` 和压力投影中的 `alpha_f = dt / rho_f` 进入，而不应该把 `volume_fraction` 当成密度。
+
+### 13.2 压力 RHS 的 `s` 目标固定为填充率 1
+
+压力方程仍写成：
+
+```txt
+U_new = U* - alpha grad(p)
+div(U_new) = s
+A p = s - div(U*)
+```
+
+其中 `s` 的体积修正目标现在固定为：
+
+```txt
+target_fill_fraction = 1.0
+```
+
+也就是说，过满 / 欠填的判定只看 cell 填充率是否偏离 1：
+
+```txt
+pressure_fill_fraction = max(current volume_fraction, backtraced pressure volume_fraction)
+excess  = max(pressure_fill_fraction - 1, 0)
+deficit = max(1 - current volume_fraction, 0)
+
+s = density_correction_strength * excess / dt
+if internal_liquid:
+    s -= underfill_correction_strength * deficit / dt
+```
+
+这样做的目的：
+
+- `volume_fraction > 1`：要求净流出，修正被压缩的体积。
+- 内部 `volume_fraction < 1`：要求净流入，填补水体内部空洞。
+- 自由表面 `volume_fraction < 1`：不做 underfill，避免空气边界持续吸水。
+- 油/水/毒液的密度差只通过 `rho` 影响 `alpha`，不改变填充率目标。
+
+### 13.3 刚体运动与液体挤出已经解耦
+
+刚体 solver 现在只负责刚体自身运动、碰撞、sleep、以及把自由刚体 raster 成动态刚体 overlay：
+
+```txt
+RigidBodySolver::step()
+  -> populate_dynamic_cells()
+       writes WorldGrid::rigid_body_id / rigid_velocity_x / rigid_velocity_y
+       records RigidCellOccupancy list
+```
+
+它不再直接搬运水。刚体与液体的交互放在组装层：
+
+```txt
+MacSimulation::run_pre_fluid_solvers()
+  1. rigid_solver.step(grid)
+  2. resolve_rigid_liquid_overlaps()
+  3. powder_solver.step(...)
+  4. fluid_solver.begin_step_job()
+```
+
+`resolve_rigid_liquid_overlaps()` 读取 `RigidBodySolver::get_current_occupied_cells()`。如果某个本帧移动刚体覆盖了液体 cell，就把该 cell 的液体 payload 通过局部 BFS 挤到附近可进入 cell：
+
+```txt
+preferred directions:
+  left/up-left, left, right, right/up-right, down, up, down-left, down-right
+max visits: 96 cells
+max temporary fill after displacement: 2.0
+```
+
+搬运内容包括：
+
+```txt
+volume_fraction
+oil phase volume
+toxic amount
+temperature
+velocity inherited from rigid contact velocity
+```
+
+目标 cell 如果已有液体，则按填充体积混合；如果是 air/gas，则转成液体。最终压力投影会继续把临时 `volume_fraction > 1` 的区域推平。因此刚体运动本身和“刚体挤开水”的近似交互已经分层：刚体 solver 只产出本帧 occupied cells，MacSimulation 负责解释这些 overlap 对液体意味着什么。
+
+### 13.4 2026-07-05 update: boundary-touch rigid-liquid displacement
+
+Rigid-liquid displacement was changed from per-overlapped-cell BFS to a cheaper boundary-touch method.
+
+Frame/lifecycle location:
+
+```txt
+MacSimulation::run_pre_fluid_solvers()
+  rigid_solver.step(grid)
+    RigidBodySolver::populate_dynamic_cells()
+      writes rigid overlay
+      records RigidCellOccupancy { x, y, body_id, vx, vy, moving, boundary }
+  MacSimulation::resolve_rigid_liquid_overlaps()
+```
+
+Algorithm:
+
+```txt
+1. Only moving rigid occupied cells are considered.
+2. Only boundary occupied cells perform liquid-touch tests.
+3. If a moving boundary cell sees liquid in its 3x3 neighborhood,
+   mark that rigid body as liquid-touching.
+4. For that boundary cell, collect non-rigid, non-solid neighbor targets
+   in a 2-cell Manhattan neighborhood.  Air, gas, and liquid cells are valid.
+5. Deduplicate targets per body.
+6. For every occupied cell of marked bodies:
+   if the underlying grid material is liquid:
+       move that liquid directly into a pseudo-random order of the body's
+       collected boundary targets.
+```
+
+This avoids maintaining liquid chunk indices and avoids rebuilding liquid chunk hashes.  The broad phase is simply the active/moving rigid boundary itself: if a body boundary never touches liquid, none of that body's interior occupied cells are tested for liquid displacement.
+
+The displacement is intentionally approximate and Noita-like rather than physically exact:
+
+```txt
+max temporary target fill = 2.0
+phase volumes moved = volume_fraction / oil / toxic
+target velocity receives the rigid contact velocity by volume-weighted mixing
+```
+
+Pressure projection then removes the temporary overfill in later fluid phases.
+
+### 13.5 2026-07-05 update: rigid-liquid splash impulse
+
+Displaced liquid now receives an initial velocity impulse instead of only being moved volumetrically.
+
+Parameter exposed to Godot/GDScript:
+
+```text
+rigid_liquid_impulse_strength
+```
+
+Code locations:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_simulation.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\src\mac_world.h/.cpp
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\mac_main.gd
+```
+
+For each displaced liquid parcel, the target velocity uses:
+
+```text
+displacement_dir = normalize(target_cell - overlapped_rigid_cell)
+rigid_speed = length(rigid_cell_velocity)
+splash_speed = rigid_speed * rigid_liquid_impulse_strength
+
+displaced_velocity = rigid_cell_velocity + displacement_dir * splash_speed
+```
+
+Then the target cell velocity is volume-weighted with any liquid already there.  Physically this is an approximate momentum-transfer / splash-strength coefficient: larger values make water splash farther away from the rigid body; zero means pure displacement without extra outward impulse.
+
+Godot UI adds a compact slider:
+
+```text
+rigid-liquid splash impulse: 0.00 - 3.00, default 0.45
+```
+
+The debug panel was also slightly shrunk to make room for the extra control.
+
+### 13.6 2026-07-05 update: biased random target direction for rigid-liquid displacement
+
+The rigid-liquid displacement target selection is now vertically biased:
+
+```text
+30% of displaced-liquid events prefer targets above the overlapped cell
+70% of displaced-liquid events prefer targets below the overlapped cell
+```
+
+In screen coordinates this means:
+
+```text
+above: target_y < source_y
+below: target_y > source_y
+```
+
+Implementation detail:
+
+```text
+prefer_above = hash(source_cell, body_id) % 10 < 3
+```
+
+The solver first tries targets on the preferred side in pseudo-random order.  If that side has no capacity, it falls back to any valid target so liquid is not deleted by a saturated preferred side.
+
+## 14. 2026-07-05: threaded two-world simulation test
+
+Before this change, `MacWorld` simulation was effectively single-threaded: `_process()` on the Godot main thread advanced `MacSimulation`, then filled RGBA pixels, then uploaded the texture.
+
+A test-only threaded mode was added to `MacWorld`:
+
+```text
+MacWorld::set_threaded_simulation_enabled(true)
+```
+
+When enabled:
+
+```text
+worker std::thread:
+  lock sim mutex
+  sim.step()
+  unlock
+  sleep until next sim dt
+
+Godot main thread:
+  lock sim mutex briefly
+  fill_rgba_pixels()
+  unlock
+  upload ImageTexture and draw
+```
+
+Important limitation: this is a coarse per-world thread test.  It does not yet split one large world into chunks.  Instead, it verifies that two independent simulation regions can run on two separate CPU threads while the main thread only renders their latest state.
+
+New test scene:
+
+```text
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\threaded_test.tscn
+D:\AICode\Emergence\Noita\NoitaCppExtension\project\threaded_test.gd
+```
+
+The scene creates two `MacWorld` instances side by side and enables threaded simulation for both.  Each world owns its own `MacSimulation` and its own worker thread.  This is the first stepping stone toward future chunk-based multithreading:
+
+```text
+current test:  world A -> thread A, world B -> thread B
+future design: chunk group A -> worker A, chunk group B -> worker B, with border exchange
+```

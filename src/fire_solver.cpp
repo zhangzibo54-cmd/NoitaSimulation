@@ -1,4 +1,4 @@
-﻿#include "fire_solver.h"
+#include "fire_solver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,7 +31,7 @@ bool FireSolver::touches_liquid_material(const WorldGrid &p_grid, int32_t p_x, i
 			continue;
 		}
 		const int32_t i = p_grid.cell_index(x, y);
-		if (p_grid.material[i] == p_material && p_grid.volume[i] > 0.01f) {
+		if (p_grid.material[i] == p_material && p_grid.volume_fraction[i] > 0.01f) {
 			return true;
 		}
 	}
@@ -57,7 +57,7 @@ bool FireSolver::try_spread_to_fuel(WorldGrid &p_grid, int32_t p_x, int32_t p_y)
 				fed = true;
 			}
 		} else if (mat == MATERIAL_TOXIC) {
-			p_grid.make_toxic_gas(x, y, std::max(0.25f, p_grid.volume[i]));
+			p_grid.make_toxic_gas(x, y, std::max(0.25f, p_grid.volume_fraction[i]));
 			fed = true;
 		}
 	}
@@ -111,3 +111,4 @@ void FireSolver::step(WorldGrid &p_grid) {
 		}
 	}
 }
+

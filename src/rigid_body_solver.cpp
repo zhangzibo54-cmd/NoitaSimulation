@@ -58,6 +58,7 @@ void RigidBodySolver::clear() {
 	temp_keys.clear();
 	temp_indices.clear();
 	temp_pair_keys.clear();
+	current_occupied_cells.clear();
 	dirty_cells.clear();
 	flood_queue.clear();
 	island_cells.clear();
@@ -1738,98 +1739,9 @@ void RigidBodySolver::bake_body_to_grid(WorldGrid &p_grid, RigidBody &r_body) {
 	r_body.active = false;
 }
 
-bool RigidBodySolver::can_displace_into(const WorldGrid &p_grid, int32_t p_x, int32_t p_y) const {
-	if (!p_grid.in_bounds(p_x, p_y)) {
-		return false;
-	}
-	const int32_t i = p_grid.cell_index(p_x, p_y);
-	if (p_grid.rigid_body_id[i] != 0) {
-		return false;
-	}
-	return !get_material_def(p_grid.material[i]).blocks_velocity;
-}
-
-bool RigidBodySolver::displace_cell_from_rigid(WorldGrid &p_grid, int32_t p_x, int32_t p_y, float p_vx, float p_vy) {
-	if (!p_grid.in_bounds(p_x, p_y)) {
-		return false;
-	}
-	const int32_t from = p_grid.cell_index(p_x, p_y);
-	const MaterialDef &src_def = get_material_def(p_grid.material[from]);
-	if (p_grid.material[from] == MATERIAL_AIR || src_def.blocks_velocity || p_grid.material[from] == MATERIAL_FIRE) {
-		return true;
-	}
-
-	const int sx = p_vx > 0.05f ? 1 : (p_vx < -0.05f ? -1 : 0);
-	const int sy = p_vy > 0.05f ? 1 : (p_vy < -0.05f ? -1 : 0);
-	const int side = sx != 0 ? sx : 1;
-	const int dirs[8][2] = {
-		{ sx, sy },
-		{ side, 0 },
-		{ -side, 0 },
-		{ 0, -1 },
-		{ side, -1 },
-		{ -side, -1 },
-		{ 0, 1 },
-		{ sx, 0 },
-	};
-
-	for (const auto &dir : dirs) {
-		const int32_t tx = p_x + dir[0];
-		const int32_t ty = p_y + dir[1];
-		if (!can_displace_into(p_grid, tx, ty)) {
-			continue;
-		}
-		const int32_t to = p_grid.cell_index(tx, ty);
-		const MaterialDef &dst_def = get_material_def(p_grid.material[to]);
-
-		if (src_def.powder && (dst_def.solid || dst_def.powder)) {
-			continue;
-		}
-		if (src_def.liquid && !(p_grid.material[to] == MATERIAL_AIR || dst_def.gas || dst_def.liquid)) {
-			continue;
-		}
-		if (src_def.gas && !(p_grid.material[to] == MATERIAL_AIR || dst_def.gas)) {
-			continue;
-		}
-
-		const uint8_t src_mat = p_grid.material[from];
-		const float src_volume = p_grid.volume[from];
-		const float src_density = p_grid.density[from];
-		const float src_toxic = p_grid.toxic[from];
-		const float src_oil = p_grid.oil[from];
-		const float src_temp = p_grid.temperature[from];
-		const float src_life = p_grid.lifetime[from];
-
-		if (src_def.liquid && dst_def.liquid) {
-			const float old_vol = std::max(0.0f, p_grid.volume[to]);
-			const float new_vol = std::max(0.0f, old_vol + src_volume);
-			p_grid.volume[to] = new_vol;
-			p_grid.toxic[to] = clampf(p_grid.toxic[to] + src_toxic, 0.0f, new_vol);
-			p_grid.oil[to] = clampf(p_grid.oil[to] + src_oil, 0.0f, new_vol);
-			const float oil_f = new_vol > 0.01f ? clampf(p_grid.oil[to] / new_vol, 0.0f, 1.0f) : 0.0f;
-			const float toxic_f = new_vol > 0.01f ? clampf(p_grid.toxic[to] / new_vol, 0.0f, 1.0f) : 0.0f;
-			p_grid.material[to] = (toxic_f > 0.25f && oil_f < 0.5f) ? MATERIAL_TOXIC : (oil_f >= 0.5f ? MATERIAL_OIL : MATERIAL_WATER);
-			p_grid.density[to] = get_material_def(MATERIAL_WATER).density * (1.0f - oil_f) + get_material_def(MATERIAL_OIL).density * oil_f;
-			p_grid.temperature[to] = std::max(p_grid.temperature[to], src_temp);
-		} else {
-			p_grid.material[to] = src_mat;
-			p_grid.volume[to] = src_volume;
-			p_grid.density[to] = src_density;
-			p_grid.toxic[to] = src_toxic;
-			p_grid.oil[to] = src_oil;
-			p_grid.temperature[to] = src_temp;
-			p_grid.lifetime[to] = src_life;
-		}
-		p_grid.velocity_x[to] = p_vx;
-		p_grid.velocity_y[to] = p_vy;
-		p_grid.make_air(p_x, p_y);
-		return true;
-	}
-	return false;
-}
-
 void RigidBodySolver::populate_dynamic_cells(WorldGrid &p_grid) {
 	p_grid.clear_rigid_fields();
+	current_occupied_cells.clear();
 	std::vector<CoveredCell> covered;
 	for (const RigidBody &body : bodies) {
 		if (!body.active) {
@@ -1843,11 +1755,14 @@ void RigidBodySolver::populate_dynamic_cells(WorldGrid &p_grid) {
 			const float ry = (static_cast<float>(y) + 0.5f) - body.y;
 			const float cvx = body.vx - body.angular_velocity * ry;
 			const float cvy = body.vy + body.angular_velocity * rx;
-			displace_cell_from_rigid(p_grid, x, y, cvx, cvy);
 			const int32_t i = p_grid.cell_index(x, y);
 			p_grid.rigid_body_id[i] = body.id;
 			p_grid.rigid_velocity_x[i] = cvx;
 			p_grid.rigid_velocity_y[i] = cvy;
+			const float speed2 = cvx * cvx + cvy * cvy;
+			const bool is_boundary = c.source_index >= 0 &&
+					std::binary_search(body.boundary_indices.begin(), body.boundary_indices.end(), c.source_index);
+			current_occupied_cells.push_back({ x, y, body.id, cvx, cvy, !body.sleeping && (body.id == dragged_body || speed2 > 1.0e-5f), is_boundary });
 		}
 	}
 }
@@ -2011,6 +1926,11 @@ void RigidBodySolver::spawn_collision_test(WorldGrid &p_grid) {
 	populate_dynamic_cells(p_grid);
 }
 
+
+const std::vector<RigidBodySolver::RigidCellOccupancy> &RigidBodySolver::get_current_occupied_cells() const {
+	return current_occupied_cells;
+}
+
 void RigidBodySolver::draw_overlay_rgba(const WorldGrid &p_grid, std::vector<uint8_t> &r_pixels) const {
 	if (r_pixels.empty()) {
 		return;
@@ -2142,3 +2062,5 @@ int32_t RigidBodySolver::get_sleeping_body_count() const {
 	}
 	return count;
 }
+
+

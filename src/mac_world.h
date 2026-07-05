@@ -7,7 +7,10 @@
 #include <godot_cpp/classes/node2d.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 using namespace godot;
@@ -33,16 +36,21 @@ public:
 
 private:
 	MacSimulation sim;
+	mutable std::mutex sim_mutex;
 
 	float display_scale = 3.0f;
-	bool paused = false;
+	std::atomic_bool paused = false;
+	std::atomic_bool threaded_simulation_enabled = false;
+	std::atomic_bool simulation_thread_running = false;
+	std::thread simulation_thread;
 	float simulation_speed = 1.0f;
 	float step_accumulator = 0.0f;
-	double last_sim_ms = 0.0;
+	double fluid_budget_ms = 4.0;
+	std::atomic<double> last_sim_ms = 0.0;
 	double last_fill_ms = 0.0;
 	double last_texture_ms = 0.0;
-	double last_frame_sim_ms = 0.0;
-	int32_t last_frame_sim_steps = 0;
+	std::atomic<double> last_frame_sim_ms = 0.0;
+	std::atomic<int32_t> last_frame_sim_steps = 0;
 
 	std::vector<uint8_t> rgba_pixels;
 	PackedByteArray pixels;
@@ -51,13 +59,16 @@ private:
 
 	void run_sim_step();
 	void update_texture();
+	void simulation_thread_loop();
+	void start_simulation_thread();
+	void stop_simulation_thread();
 
 protected:
 	static void _bind_methods();
 
 public:
 	MacWorld();
-	~MacWorld() override = default;
+	~MacWorld() override;
 
 	void _ready() override;
 	void _process(double p_delta) override;
@@ -71,6 +82,8 @@ public:
 
 	void set_paused(bool p_paused);
 	bool is_paused() const;
+	void set_threaded_simulation_enabled(bool p_enabled);
+	bool is_threaded_simulation_enabled() const;
 	void set_simulation_speed(double p_speed);
 	double get_simulation_speed() const;
 	void set_dt(double p_dt);
@@ -87,6 +100,8 @@ public:
 	double get_density_correction_strength() const;
 	void set_underfill_correction_strength(double p_strength);
 	double get_underfill_correction_strength() const;
+	void set_rigid_liquid_impulse_strength(double p_strength);
+	double get_rigid_liquid_impulse_strength() const;
 
 	void step();
 	void clear();
@@ -107,6 +122,18 @@ public:
 	int64_t get_water_cell_count() const;
 	double get_average_water_mass() const;
 	double get_last_step_ms() const;
+	double get_last_predict_ms() const;
+	double get_last_build_ms() const;
+	double get_last_pcg_ms() const;
+	double get_last_project_ms() const;
+	double get_last_advect_ms() const;
+	double get_last_clamp_ms() const;
+	int32_t get_active_region_min_x() const;
+	int32_t get_active_region_min_y() const;
+	int32_t get_active_region_max_x() const;
+	int32_t get_active_region_max_y() const;
+	int32_t get_active_region_pad() const;
+	double get_active_region_max_speed() const;
 	double get_last_sim_ms() const;
 	double get_last_fill_ms() const;
 	double get_last_texture_ms() const;
@@ -116,3 +143,4 @@ public:
 	int32_t get_last_pcg_iterations() const;
 	double get_last_pcg_residual() const;
 };
+

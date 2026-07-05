@@ -74,3 +74,4 @@ inline const MaterialDef &solid_boundary_material_def() {
 }
 
 } // namespace noita
+

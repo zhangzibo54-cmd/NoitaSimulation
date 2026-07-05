@@ -39,8 +39,14 @@ private:
 	bool gas_present = false;
 	bool fire_present = false;
 	bool rigid_paint_stroke_active = false;
+	bool budgeted_step_active = false;
+	bool budgeted_step_had_powder = false;
+	float rigid_liquid_impulse_strength = 0.45f;
 
 	void resolve_fluid_powder_interactions();
+	void resolve_rigid_liquid_overlaps();
+	void run_pre_fluid_solvers();
+	void run_post_fluid_solvers();
 
 public:
 	MacSimulation();
@@ -63,8 +69,13 @@ public:
 	double get_density_correction_strength() const;
 	void set_underfill_correction_strength(double p_strength);
 	double get_underfill_correction_strength() const;
+	void set_rigid_liquid_impulse_strength(double p_strength);
+	double get_rigid_liquid_impulse_strength() const;
 
 	void step();
+	void begin_budgeted_step();
+	bool advance_budgeted_step(double p_fluid_budget_ms);
+	bool has_pending_budgeted_step() const;
 	void clear();
 	void generate_basin();
 	void generate_rigid_collision_test();
@@ -84,7 +95,20 @@ public:
 	int64_t get_water_cell_count() const;
 	double get_average_water_mass() const;
 	double get_last_step_ms() const;
+	double get_last_predict_ms() const;
+	double get_last_build_ms() const;
+	double get_last_pcg_ms() const;
+	double get_last_project_ms() const;
+	double get_last_advect_ms() const;
+	double get_last_clamp_ms() const;
+	int32_t get_active_region_min_x() const;
+	int32_t get_active_region_min_y() const;
+	int32_t get_active_region_max_x() const;
+	int32_t get_active_region_max_y() const;
+	int32_t get_active_region_pad() const;
+	double get_active_region_max_speed() const;
 	int64_t get_step_count() const;
 	int32_t get_last_pcg_iterations() const;
 	double get_last_pcg_residual() const;
 };
+
