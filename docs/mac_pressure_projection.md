@@ -3651,3 +3651,47 @@ The scene creates two `MacWorld` instances side by side and enables threaded sim
 current test:  world A -> thread A, world B -> thread B
 future design: chunk group A -> worker A, chunk group B -> worker B, with border exchange
 ```
+
+### 14.1 2026-07-06: step(max_time_ms) wrapper and simpler MacWorld scheduling
+
+The budgeted simulation API has been wrapped so callers no longer need to manually call:
+
+```cpp
+begin_budgeted_step();
+while (has_pending_budgeted_step()) {
+    advance_budgeted_step(...);
+}
+```
+
+New shape:
+
+```cpp
+bool MacSimulation::step(double max_time_ms = 1000000.0);
+bool MacSimulation::has_pending_step() const;
+
+bool MacFluidSolver::step(double max_time_ms = 1000000.0);
+```
+
+Semantics:
+
+```text
+step(max_time_ms):
+  if no tick is pending, start one
+  run current tick until either:
+    - tick is complete -> return true
+    - max_time_ms is consumed -> return false
+```
+
+This works because `MacFluidSolver::advance_step_job()` already contains the inner phase loop, phase order, timing checks, and resume-from-interruption state.  If `max_time_ms` is huge, one call finishes the whole tick; if it is small, later calls continue from the saved phase.
+
+`MacWorld::_process()` non-thread mode now only decides whether a tick is due or already pending, then calls:
+
+```cpp
+completed = sim.step(remaining_budget_ms);
+```
+
+Thread mode continues to use:
+
+```cpp
+sim.step(); // default huge budget: complete one full tick in the worker thread
+```

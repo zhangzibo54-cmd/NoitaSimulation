@@ -75,11 +75,18 @@ double MacSimulation::get_underfill_correction_strength() const { return fluid_s
 void MacSimulation::set_rigid_liquid_impulse_strength(double p_strength) { rigid_liquid_impulse_strength = clampf(static_cast<float>(p_strength), 0.0f, 3.0f); }
 double MacSimulation::get_rigid_liquid_impulse_strength() const { return rigid_liquid_impulse_strength; }
 
-void MacSimulation::step() {
-	begin_budgeted_step();
-	while (has_pending_budgeted_step()) {
-		advance_budgeted_step(1000000.0);
+bool MacSimulation::step(double p_max_time_ms) {
+	if (!budgeted_step_active) {
+		begin_budgeted_step();
 	}
+	if (!budgeted_step_active) {
+		return true;
+	}
+	return advance_budgeted_step(p_max_time_ms);
+}
+
+bool MacSimulation::has_pending_step() const {
+	return budgeted_step_active;
 }
 
 void MacSimulation::run_pre_fluid_solvers() {

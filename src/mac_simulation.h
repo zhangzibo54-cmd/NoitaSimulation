@@ -72,7 +72,8 @@ public:
 	void set_rigid_liquid_impulse_strength(double p_strength);
 	double get_rigid_liquid_impulse_strength() const;
 
-	void step();
+	bool step(double p_max_time_ms = 1000000.0);
+	bool has_pending_step() const;
 	void begin_budgeted_step();
 	bool advance_budgeted_step(double p_fluid_budget_ms);
 	bool has_pending_budgeted_step() const;

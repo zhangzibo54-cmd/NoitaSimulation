@@ -186,7 +186,7 @@ public:
 	void set_underfill_correction_strength(double p_strength);
 	double get_underfill_correction_strength() const;
 
-	void step();
+	bool step(double p_budget_ms = 1000000.0);
 	void begin_step_job();
 	bool advance_step_job(double p_budget_ms);
 	bool has_pending_step_job() const;

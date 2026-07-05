@@ -1261,11 +1261,14 @@ void MacFluidSolver::update_world_velocity_field() {
 	}
 }
 
-void MacFluidSolver::step() {
-	begin_step_job();
-	while (has_pending_step_job()) {
-		advance_step_job(1000000.0);
+bool MacFluidSolver::step(double p_budget_ms) {
+	if (!step_job_active) {
+		begin_step_job();
 	}
+	if (!step_job_active) {
+		return true;
+	}
+	return advance_step_job(p_budget_ms);
 }
 
 void MacFluidSolver::begin_step_job() {

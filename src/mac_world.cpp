@@ -138,14 +138,13 @@ void MacWorld::_process(double p_delta) {
 		bool completed = false;
 		{
 			std::lock_guard<std::mutex> lock(sim_mutex);
-			if (!sim.has_pending_budgeted_step()) {
+			if (!sim.has_pending_step()) {
 				if (step_accumulator < target_interval) {
 					break;
 				}
-				sim.begin_budgeted_step();
 				step_accumulator -= static_cast<float>(target_interval);
 			}
-			completed = sim.advance_budgeted_step(remaining_budget);
+			completed = sim.step(remaining_budget);
 		}
 		const auto sim_end = std::chrono::steady_clock::now();
 		last_sim_ms = elapsed_ms(sim_start, sim_end);
